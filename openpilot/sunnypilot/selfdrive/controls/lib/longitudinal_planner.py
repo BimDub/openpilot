@@ -34,7 +34,6 @@ class LongitudinalPlannerSP:
     self.throttle_intent_controller = ThrottleIntentController(mpc.dt)
     self.lead_departure_controller = LeadDepartureController(CP.openpilotLongitudinalControl and CP.autoResumeSng and not CP.notCar)
     self.events_sp = EventsSP()
-    self.resolver = SpeedLimitResolver()
     self.dec = DynamicExperimentalController(CP, mpc)
     self.scc = SmartCruiseControl()
     self.resolver = SpeedLimitResolver()
