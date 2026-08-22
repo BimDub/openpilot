@@ -87,7 +87,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
-    if sm['controlsState'].forceDecel:
+    force_decel = sm['controlsState'].forceDecel
+    if force_decel:
       v_cruise = 0.0
 
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
@@ -100,7 +101,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
 
     throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
     throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
-    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
+    self.allow_throttle = self.update_allow_throttle(throttle_prob, low_speed_override=v_ego <= MIN_ALLOW_THROTTLE_SPEED,
+                                                     threshold=ALLOW_THROTTLE_THRESHOLD)
 
     steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
 
@@ -146,9 +148,15 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     is_e2e = self.is_e2e(sm)
 
     max_accel_override = self.get_max_accel_override(v_ego, is_e2e)
-    self.a_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego,
-                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
-                                     accel_coast, self.allow_throttle, max_accel_override)
+    a_cruise_prev = self.a_cruise
+    gated_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego, a_cruise_prev, steer_angle_without_offset,
+                                    self.CP, self.dt, accel_coast, self.allow_throttle, max_accel_override)
+    ungated_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego, a_cruise_prev, steer_angle_without_offset,
+                                      self.CP, self.dt, accel_coast, True, max_accel_override)
+    self.a_cruise = self.arbitrate_cruise_candidate(
+      sm, gated_cruise, ungated_cruise, output_a_target_mpc, self.mpc.source,
+      allow_throttle=self.allow_throttle, e2e=is_e2e, force_decel=force_decel,
+    )
     cruise_should_stop = should_stop(v_ego, self.a_cruise)
 
     candidates = [(output_a_target_mpc, self.mpc.source, output_should_stop_mpc),
@@ -183,6 +191,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     longitudinalPlan.aTarget = float(self.output_a_target)
     longitudinalPlan.shouldStop = bool(self.output_should_stop)
     longitudinalPlan.allowBrake = True
+    # Raw model throttle intent used for path visualization; lead MPC can still request positive acceleration.
     longitudinalPlan.allowThrottle = bool(self.allow_throttle)
 
     pm.send('longitudinalPlan', plan_send)

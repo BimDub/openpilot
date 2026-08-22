@@ -5,7 +5,9 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
 
-from openpilot.cereal import messaging, custom
+import math
+
+from openpilot.cereal import messaging, custom, log
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
@@ -16,17 +18,20 @@ from openpilot.sunnypilot.selfdrive.controls.lib.lead_departure_controller impor
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_resolver import SpeedLimitResolver
+from openpilot.sunnypilot.selfdrive.controls.lib.throttle_intent_controller import ThrottleIntentController
 from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 
 DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimentalControlState
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
+MpcPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 
 
 class LongitudinalPlannerSP:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
     self.accel_controller = AccelController()
     self.accel_controller_active = False
+    self.throttle_intent_controller = ThrottleIntentController(mpc.dt)
     self.lead_departure_controller = LeadDepartureController(CP.openpilotLongitudinalControl and CP.autoResumeSng and not CP.notCar)
     self.events_sp = EventsSP()
     self.resolver = SpeedLimitResolver()
@@ -54,6 +59,25 @@ class LongitudinalPlannerSP:
     if not self.accel_controller_active:
       return None
     return self.accel_controller.get_max_accel(v_ego)
+
+  def update_allow_throttle(self, throttle_prob: float, low_speed_override: bool, threshold: float) -> bool:
+    return self.throttle_intent_controller.update(throttle_prob, low_speed_override=low_speed_override, threshold=threshold)
+
+  def _has_valid_selected_lead(self, sm: messaging.SubMaster, source: MpcPlanSource) -> bool:
+    radar_valid = sm.valid.get('radarState', False) and getattr(sm, 'alive', {}).get('radarState', False)
+    return radar_valid and ((source == MpcPlanSource.lead0 and sm['radarState'].leadOne.present) or
+                            (source == MpcPlanSource.lead1 and sm['radarState'].leadTwo.present))
+
+  def arbitrate_cruise_candidate(self, sm: messaging.SubMaster, gated: float, ungated: float,
+                                 mpc_accel: float, mpc_source: MpcPlanSource, *, allow_throttle: bool,
+                                 e2e: bool, force_decel: bool) -> float:
+    finite = all(math.isfinite(value) for value in (gated, ungated, mpc_accel))
+    coast_gate_changed_source = gated < mpc_accel <= ungated
+    if (finite and not allow_throttle and not e2e and not force_decel
+        and self._has_valid_selected_lead(sm, mpc_source) and coast_gate_changed_source):
+      return ungated
+
+    return gated
 
   def update_lead_departure(self, sm: messaging.SubMaster, a_target: float, should_stop: bool, reset: bool) -> bool:
     radar_valid = sm.valid.get('radarState', False) and getattr(sm, 'alive', {}).get('radarState', False)
