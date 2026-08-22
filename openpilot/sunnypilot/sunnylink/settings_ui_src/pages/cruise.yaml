@@ -43,6 +43,28 @@ sections:
       label: Relaxed
     enablement:
     - $ref: '#/macros/longitudinal'
+  - key: AccelPersonalityEnabled
+    widget: toggle
+    title: Enable Accel Controller
+    description: Lets you choose the acceleration response. Lead following, braking, and stopping are unchanged.
+    visibility:
+    - $ref: '#/macros/longitudinal'
+    enablement:
+    - $ref: '#/macros/longitudinal'
+  - key: AccelPersonality
+    widget: multiple_button
+    title: Acceleration Profile
+    description: Eco accelerates more gently, Normal matches the stock cruise response, and Sport adds stronger low-speed
+      acceleration.
+    options:
+    - value: 0
+      label: Eco
+    - value: 1
+      label: Normal
+    - value: 2
+      label: Sport
+    enablement:
+    - $ref: '#/macros/longitudinal'
   - key: IntelligentCruiseButtonManagement
     widget: toggle
     title: Intelligent Cruise Button Management (ICBM) (Alpha)

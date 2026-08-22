@@ -653,6 +653,53 @@
               ]
             },
             {
+              "key": "AccelPersonalityEnabled",
+              "widget": "toggle",
+              "title": "Enable Accel Controller",
+              "description": "Lets you choose the acceleration response. Lead following, braking, and stopping are unchanged.",
+              "visibility": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ]
+            },
+            {
+              "key": "AccelPersonality",
+              "widget": "multiple_button",
+              "title": "Acceleration Profile",
+              "description": "Eco accelerates more gently, Normal matches the stock cruise response, and Sport adds stronger low-speed acceleration.",
+              "options": [
+                {
+                  "value": 0,
+                  "label": "Eco"
+                },
+                {
+                  "value": 1,
+                  "label": "Normal"
+                },
+                {
+                  "value": 2,
+                  "label": "Sport"
+                }
+              ],
+              "enablement": [
+                {
+                  "type": "capability",
+                  "field": "has_longitudinal_control",
+                  "equals": true
+                }
+              ]
+            },
+            {
               "key": "IntelligentCruiseButtonManagement",
               "widget": "toggle",
               "title": "Intelligent Cruise Button Management (ICBM) (Alpha)",
