@@ -11,7 +11,7 @@ from openpilot.cereal import messaging, custom, log
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
-from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelController, AccelProfile
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.lead_departure_controller import LeadDepartureController
@@ -52,12 +52,17 @@ class LongitudinalPlannerSP:
 
     return experimental_mode and self.dec.mode() == "blended"
 
-  def get_max_accel_override(self, v_ego: float, e2e: bool) -> float | None:
-    custom_profile = self.accel_controller.profile != AccelProfile.normal
-    self.accel_controller_active = bool(self.accel_controller.is_enabled() and custom_profile and not e2e)
+  def get_max_accel_override(self, v_ego: float, v_target: float, e2e: bool) -> float | None:
+    self.accel_controller_active = bool(self.accel_controller.is_enabled() and (e2e or self.allow_throttle))
     if not self.accel_controller_active:
       return None
-    return self.accel_controller.get_max_accel(v_ego)
+    target = v_target if self.source == LongitudinalPlanSource.cruise else None
+    return self.accel_controller.get_max_accel(v_ego, target)
+
+  def get_cruise_target_override(self, v_ego: float, v_target: float, e2e: bool) -> float:
+    if not self.accel_controller.is_enabled() or self.source != LongitudinalPlanSource.cruise or not (e2e or self.allow_throttle):
+      return v_target
+    return self.accel_controller.get_cruise_target(v_ego, v_target)
 
   def update_allow_throttle(self, throttle_prob: float, low_speed_override: bool, threshold: float) -> bool:
     return self.throttle_intent_controller.update(throttle_prob, low_speed_override=low_speed_override, threshold=threshold)

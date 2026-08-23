@@ -28,10 +28,10 @@ DESCRIPTIONS = {
     "your steering wheel distance button."
   ),
   "AccelPersonalityEnabled": tr_noop(
-    "Lets you choose the acceleration response. Lead following, braking, and stopping are unchanged."
+    "Lets you choose how sunnypilot starts, catches up, and settles at the cruise speed. Emergency braking and stopping are unchanged."
   ),
   "AccelPersonality": tr_noop(
-    "Eco accelerates more gently, Normal matches the stock cruise response, and Sport adds stronger low-speed acceleration."
+    "Eco is gentlest, Normal balances a prompt start with smooth catch-up, and Sport is more responsive."
   ),
   "IsLdwEnabled": tr_noop(
     "Receive alerts to steer back into the lane when your vehicle drifts over a detected lane line " +

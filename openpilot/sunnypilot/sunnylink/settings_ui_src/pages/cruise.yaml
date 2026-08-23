@@ -46,7 +46,8 @@ sections:
   - key: AccelPersonalityEnabled
     widget: toggle
     title: Enable Accel Controller
-    description: Lets you choose the acceleration response. Lead following, braking, and stopping are unchanged.
+    description: Lets you choose how sunnypilot starts, catches up, and settles at the cruise speed. Emergency braking and stopping are
+      unchanged.
     visibility:
     - $ref: '#/macros/longitudinal'
     enablement:
@@ -54,8 +55,7 @@ sections:
   - key: AccelPersonality
     widget: multiple_button
     title: Acceleration Profile
-    description: Eco accelerates more gently, Normal matches the stock cruise response, and Sport adds stronger low-speed
-      acceleration.
+    description: Eco is gentlest, Normal balances a prompt start with smooth catch-up, and Sport is more responsive.
     options:
     - value: 0
       label: Eco
