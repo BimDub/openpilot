@@ -7,14 +7,17 @@ See the LICENSE.md file in the root directory for more details.
 
 import numpy as np
 
+from opendbc.car.interfaces import ACCEL_MAX
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
   A_CRUISE_MAX_BP, A_CRUISE_MIN, J_CRUISE_VALS, get_cruise_accel, get_max_accel,
 )
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import MAX_T, STOP_DISTANCE
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import (
   AccelController, AccelProfile, CATCHUP_ACCEL_SCALE, CATCHUP_ERROR_BREAKPOINTS, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES,
+  LEAD_COMFORT_ACCEL, LEAD_COMFORT_JERK,
   TARGET_SPEED_APPROACH_FULL_SPEED, TARGET_SPEED_APPROACH_GAIN, TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_WINDOW,
   TARGET_SPEED_DEADBAND,
 )
@@ -51,38 +54,41 @@ class TestAccelController(OpenpilotTestCase):
         assert value <= previous[profile]
         previous[profile] = value
 
-  def test_normal_stays_below_stock(self):
-    controller = self.set_profile(AccelProfile.normal)
-    for speed in np.linspace(0.0, 55.0, 551):
-      assert controller.get_max_accel(speed) <= get_max_accel(speed) + 1e-12
+  def test_profiles_stay_within_openpilot_accel_max(self):
+    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+      controller = self.set_profile(profile)
+      for speed in np.linspace(0.0, 55.0, 551):
+        assert controller.get_max_accel(speed) <= ACCEL_MAX
 
-  def test_profiles_taper_below_stock_at_road_speed(self):
+  def test_profiles_do_not_exceed_stock_at_road_speed(self):
     for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
       controller = self.set_profile(profile)
       for speed in np.linspace(8.0, 40.0, 321):
-        assert controller.get_max_accel(speed) < get_max_accel(speed)
+        assert controller.get_max_accel(speed) <= get_max_accel(speed) + 1e-12
 
-  def test_launch_caps_stay_close_to_stock(self):
-    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
-      controller = self.set_profile(profile)
-      for speed in np.linspace(0.0, 3.0, 61):
-        assert controller.get_max_accel(speed) >= 0.9 * get_max_accel(speed)
+  def test_profiles_have_material_separation(self):
+    controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
+    for speed in MAX_ACCEL_BREAKPOINTS:
+      eco, normal, sport = (controller.get_max_accel(speed) for controller in controllers)
+      assert normal - eco >= 0.1
+      assert sport - normal >= 0.1
+    for speed in MAX_ACCEL_BREAKPOINTS[1:-1]:
+      assert controllers[2].get_max_accel(speed) - controllers[0].get_max_accel(speed) >= 0.3 - 1e-12
 
   def test_eco_keeps_useful_road_speed_acceleration(self):
     controller = self.set_profile(AccelProfile.eco)
     for speed in np.linspace(8.0, 40.0, 321):
-      assert controller.get_max_accel(speed) >= 0.35 * get_max_accel(speed) - 1e-12
+      assert controller.get_max_accel(speed) >= 0.25 * get_max_accel(speed) - 1e-12
 
-  def test_profile_caps_drop_quickly_after_launch(self):
-    for values in MAX_ACCEL_PROFILES.values():
-      assert values[2] <= 0.7 * values[1]
-      assert values[3] <= 0.5 * values[1]
+  def test_comfort_profile_caps_taper_after_launch(self):
+    for profile in (AccelProfile.eco, AccelProfile.normal):
+      values = MAX_ACCEL_PROFILES[profile]
+      assert values[3] <= 0.55 * values[0]
 
-  def test_sport_stays_below_reported_route_acceleration(self):
+  def test_sport_uses_openpilot_accel_max_at_launch(self):
     controller = self.set_profile(AccelProfile.sport)
-    route_samples = ((8.1, 0.877), (12.0, 0.858), (15.5, 0.802), (18.8, 0.750), (21.7, 0.654))
-    for speed, recorded_accel in route_samples:
-      assert controller.get_max_accel(speed) <= 0.85 * recorded_accel
+    assert controller.get_max_accel(0.0) == ACCEL_MAX
+    assert all(controller.get_max_accel(speed) <= ACCEL_MAX for speed in np.linspace(0.0, 55.0, 551))
 
   def test_positive_catchup_limit_is_continuous_and_monotonic(self):
     controller = self.set_profile(AccelProfile.normal)
@@ -124,6 +130,21 @@ class TestAccelController(OpenpilotTestCase):
     assert np.all(np.isfinite(shaped_errors))
     assert np.all(np.diff(shaped_errors) >= 0.0)
     assert np.all(np.abs(shaped_errors) <= np.abs(errors) + 1e-12)
+
+  def test_lead_departure_accel_is_bounded_by_lead_speed_and_profile(self):
+    controller = self.set_profile(AccelProfile.eco)
+    assert controller.get_lead_departure_accel(0.0, 0.7, 0.1, 0.1) == 0.7
+    assert controller.get_lead_departure_accel(0.0, 2.0, 0.1, 0.1) == MAX_ACCEL_PROFILES[AccelProfile.eco][0]
+
+  def test_lead_departure_accel_preserves_non_acceleration_cases(self):
+    controller = self.set_profile(AccelProfile.normal)
+    assert controller.get_lead_departure_accel(0.0, 1.0, 0.1, -0.1) == -0.1
+    assert controller.get_lead_departure_accel(0.0, 1.0, -0.1, 0.1) == 0.1
+    assert controller.get_lead_departure_accel(1.0, 1.0, 0.1, 0.1) == 0.1
+    assert controller.get_lead_departure_accel(0.0, float("nan"), 0.1, 0.1) == 0.1
+
+    self.params.put_bool("AccelPersonalityEnabled", False, block=True)
+    assert AccelController().get_lead_departure_accel(0.0, 1.0, 0.1, 0.1) == 0.1
 
   def test_catchup_limit_does_not_touch_launch(self):
     controller = self.set_profile(AccelProfile.sport)
@@ -192,6 +213,86 @@ class TestAccelController(OpenpilotTestCase):
     controller.frame = int(1.0 / DT_MDL) - 1
     controller.update()
     assert not controller.is_enabled()
+
+  def test_closing_lead_prevents_acceleration_rebound(self):
+    controller = self.set_profile(AccelProfile.normal)
+    previous_accel = -0.647
+    samples = (
+      (17.33, 120.82, -16.35, -1.70, 0.50),
+      (17.30, 88.70, -14.95, -0.76, -0.332),
+      (17.18, 103.98, -17.15, -0.24, -0.992),
+    )
+    outputs = []
+    for v_ego, d_rel, v_rel, a_lead, mpc_accel in samples:
+      lead_accel = controller.get_lead_accel(v_ego, d_rel, v_rel, a_lead, 0.31, previous_accel, 1.45)
+      previous_accel = min(lead_accel, mpc_accel)
+      outputs.append(previous_accel)
+
+    assert np.allclose(outputs, [LEAD_COMFORT_ACCEL, LEAD_COMFORT_ACCEL, -0.992])
+    assert all(accel <= 0.0 for accel in outputs)
+
+  def test_lead_comfort_does_not_replay_hard_braking(self):
+    controller = self.set_profile(AccelProfile.normal)
+    output = controller.get_lead_accel(20.0, 60.0, -8.0, -1.0, 0.5, -1.77, 1.45)
+    assert output == LEAD_COMFORT_ACCEL
+
+  def test_lead_approach_uses_existing_mpc_horizon(self):
+    controller = self.set_profile(AccelProfile.normal)
+    for t_follow in (1.25, 1.45, 1.75):
+      v_ego, v_rel, closing = 20.0, -2.0, 2.0
+      boundary = STOP_DISTANCE + t_follow * (v_ego + v_rel) + closing * MAX_T
+      assert controller.get_lead_accel(v_ego, boundary + 1e-3, v_rel, 0.0, 0.5, 0.2, t_follow) == 0.5
+      assert controller.get_lead_accel(v_ego, boundary - 1e-3, v_rel, 0.0, 0.5, 0.2, t_follow) < 0.2
+
+  def test_braking_lead_gently_removes_positive_acceleration(self):
+    controller = self.set_profile(AccelProfile.normal)
+    previous_accel = 0.544
+    outputs = []
+    for _ in range(40):
+      output = controller.get_lead_accel(30.56, 47.62, 5.5, -1.93, 0.544, previous_accel, 1.45)
+      outputs.append(output)
+      previous_accel = output
+
+    max_step = LEAD_COMFORT_JERK * DT_MDL
+    assert np.isclose(outputs[0], 0.544 - max_step)
+    assert np.all(np.diff(outputs) >= -max_step - 1e-12)
+    assert np.isclose(outputs[-1], LEAD_COMFORT_ACCEL)
+
+  def test_transient_lead_deceleration_is_one_small_step(self):
+    controller = self.set_profile(AccelProfile.normal)
+    first = controller.get_lead_accel(31.1, 51.3, 2.8, -2.5, 0.54, 0.4, 1.45)
+    second = controller.get_lead_accel(31.1, 52.0, 3.0, 0.0, 0.54, first, 1.45)
+
+    assert np.isclose(first, 0.4 - LEAD_COMFORT_JERK * DT_MDL)
+    assert second == 0.54
+
+  def test_non_closing_and_distant_leads_do_not_change_cruise(self):
+    controller = self.set_profile(AccelProfile.normal)
+    assert controller.get_lead_accel(30.0, 52.0, 0.0, 0.0, 0.1, 0.1, 1.45) == 0.1
+    assert controller.get_lead_accel(20.0, 200.0, -1.0, 0.0, 0.1, 0.1, 1.45) == 0.1
+
+  def test_accelerating_lead_returns_cruise(self):
+    controller = self.set_profile(AccelProfile.normal)
+    output = controller.get_lead_accel(20.0, 45.0, -1.0, 1.0, 0.3, -0.2, 1.45)
+    assert output == 0.3
+
+  def test_active_approach_cannot_rebound_from_brake_to_gas(self):
+    controller = self.set_profile(AccelProfile.normal)
+    output = controller.get_lead_accel(20.0, 30.0, -5.0, 1.0, 0.3, -0.2, 1.45)
+    assert -0.2 < output <= 0.0
+
+  def test_stock_lead_braking_always_wins(self):
+    controller = self.set_profile(AccelProfile.normal)
+    assert controller.get_lead_accel(20.0, 60.0, -8.0, -1.0, -2.0, 0.2, 1.45) == -2.0
+
+  def test_invalid_disabled_and_launch_cases_match_cruise(self):
+    controller = self.set_profile(AccelProfile.normal)
+    assert controller.get_lead_accel(20.0, float("nan"), -8.0, -1.0, -0.5, 0.2, 1.45) == -0.5
+    assert controller.get_lead_accel(TARGET_SPEED_APPROACH_FULL_SPEED - 0.01, 20.0, -5.0, -1.0, 0.5, 0.0, 1.45) == 0.5
+
+    self.params.put_bool("AccelPersonalityEnabled", False, block=True)
+    controller = AccelController()
+    assert controller.get_lead_accel(20.0, 60.0, -8.0, -1.0, -0.5, 0.2, 1.45) == -0.5
 
 
 class TestPlannerIntegration(OpenpilotTestCase):

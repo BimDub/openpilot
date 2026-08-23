@@ -9,9 +9,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 from openpilot.cereal import log
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelProfile
 from openpilot.sunnypilot.selfdrive.controls.lib.lead_departure_controller import LEAD_DEPARTURE_MIN_SPEED, LeadDepartureController
 from openpilot.sunnypilot.selfdrive.test.longitudinal_maneuvers.plant import PRIUS_TSS2_ROUTE_MODEL, PlantSP
 
@@ -19,8 +21,9 @@ from openpilot.sunnypilot.selfdrive.test.longitudinal_maneuvers.plant import PRI
 MpcPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 
 
-def make_lead(*, d_rel: float = 4.0, v_lead: float = 0.7, v_rel: float = 0.7, present: bool = True, radar: bool = True, track_id: int = 7):
-  return SimpleNamespace(dRel=d_rel, vLeadK=v_lead, vRel=v_rel, present=present, radar=radar, radarTrackId=track_id)
+def make_lead(*, d_rel: float = 4.0, v_lead: float = 0.7, v_rel: float = 0.7, a_lead: float = 0.0,
+              present: bool = True, radar: bool = True, track_id: int = 7):
+  return SimpleNamespace(dRel=d_rel, vLeadK=v_lead, vRel=v_rel, aLeadK=a_lead, present=present, radar=radar, radarTrackId=track_id)
 
 
 def make_sm(
@@ -58,7 +61,12 @@ def activate(controller: LeadDepartureController):
   assert controller.active
 
 
-def run_closed_loop(controller_enabled: bool, gap: float, lead_speed, duration: float, model_should_stop: bool | None = None):
+def run_closed_loop(controller_enabled: bool, gap: float, lead_speed, duration: float, model_should_stop: bool | None = None,
+                    profile_enabled: bool = False):
+  params = Params()
+  params.put_bool("AccelPersonalityEnabled", profile_enabled, block=True)
+  params.put("AccelPersonality", AccelProfile.eco, block=True)
+
   def observe_lead(_t, _name, truth):
     truth.update(radar=True, radarTrackId=7)
     return truth
@@ -76,6 +84,7 @@ def run_closed_loop(controller_enabled: bool, gap: float, lead_speed, duration: 
     e2e=model_should_stop is not None,
     model_action_fn=model_action if model_should_stop is not None else None,
   )
+  plant.v_lead_prev = lead_speed(0.0)
   plant.planner.lead_departure_controller.enabled = controller_enabled
 
   original_update = plant.planner.update
@@ -104,7 +113,8 @@ def run_closed_loop(controller_enabled: bool, gap: float, lead_speed, duration: 
       t = plant.current_time
       result = plant.step(v_lead=lead_speed(t), v_cruise=8.0)
       rows.append(
-        (t, result['speed'], result['distance'], result['distance_lead'] - result['distance'], result['actuator_command'], result['should_stop'], result['fcw'])
+        (t, result['speed'], result['distance'], result['distance_lead'] - result['distance'], result['actuator_command'], result['should_stop'], result['fcw'],
+         result['a_target'], plant.applied_actuator_command)
       )
       active.append(plant.planner.lead_departure_controller.active)
 
@@ -181,6 +191,7 @@ class TestLeadDepartureController(OpenpilotTestCase):
       ('track changed', make_sm(lead_one=make_lead(track_id=9))),
       ('lead too slow', make_sm(lead_one=make_lead(v_lead=LEAD_DEPARTURE_MIN_SPEED - 0.01))),
       ('relative speed too low', make_sm(lead_one=make_lead(v_rel=LEAD_DEPARTURE_MIN_SPEED - 0.01))),
+      ('lead braking', make_sm(lead_one=make_lead(a_lead=-0.01))),
       ('gas', make_sm(gas=True)),
       ('brake', make_sm(brake=True)),
       ('override', make_sm(override=True)),
@@ -255,7 +266,7 @@ class TestLeadDepartureController(OpenpilotTestCase):
     def lead_speed(t):
       return 0.0 if t < 1.0 else min(5.0, 0.8 * (t - 1.0))
 
-    rows, active, solver_resets = run_closed_loop(True, 4.0, lead_speed, 6.0, model_should_stop=True)
+    rows, active, solver_resets = run_closed_loop(True, 4.0, lead_speed, 6.0, model_should_stop=True, profile_enabled=True)
 
     assert any(active)
     assert solver_resets == 0
@@ -270,3 +281,33 @@ class TestLeadDepartureController(OpenpilotTestCase):
     assert stock == controller
     assert not any(stock_active) and not any(controller_active)
     assert stock_resets == controller_resets == 0
+
+  def test_profile_breakaway_assist_moves_with_a_creeping_lead(self):
+    def lead_speed(t):
+      return min(1.1, 0.66 + 0.4 * t)
+
+    baseline, baseline_active, baseline_resets = run_closed_loop(True, 2.8, lead_speed, 8.0)
+    assisted, assisted_active, assisted_resets = run_closed_loop(True, 2.8, lead_speed, 8.0, profile_enabled=True)
+
+    baseline_motion = next((row[0] for row in baseline if row[1] > 0.01), float("inf"))
+    assisted_motion = next(row[0] for row in assisted if row[1] > 0.01)
+    assert any(baseline_active) and any(assisted_active)
+    assert baseline_resets == assisted_resets == 0
+    assert assisted_motion <= 1.0
+    assert baseline_motion - assisted_motion >= 1.0
+    assert min(row[3] for row in assisted) >= min(row[3] for row in baseline) - 1e-9
+    assert not any(row[6] for row in baseline + assisted)
+    assert max(abs(right[8] - left[8]) for left, right in zip(assisted, assisted[1:], strict=False)) <= 4.0 * DT_MDL + 1e-9
+
+  def test_departure_assist_yields_when_the_lead_brakes(self):
+    def lead_speed(t):
+      return 0.8 if t < 0.8 else max(0.0, 0.8 - 4.0 * (t - 0.8))
+
+    rows, active, solver_resets = run_closed_loop(True, 2.8, lead_speed, 5.0, profile_enabled=True)
+
+    assert any(active)
+    assert solver_resets == 0
+    assert min(row[3] for row in rows) > 2.0
+    assert not any(row[6] for row in rows)
+    assert rows[-1][1] == 0.0
+    assert min(row[7] for row in rows if row[0] >= 0.8) < 0.0

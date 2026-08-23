@@ -78,10 +78,11 @@ class LeadDepartureController:
       and lead.present
       and lead.radar
       and lead.radarTrackId >= 0
-      and all(math.isfinite(value) for value in (lead.dRel, lead.vLeadK, lead.vRel))
+      and all(math.isfinite(value) for value in (lead.dRel, lead.vLeadK, lead.vRel, lead.aLeadK))
       and lead.dRel > 0.0
       and lead.vLeadK >= LEAD_DEPARTURE_MIN_SPEED
       and lead.vRel >= LEAD_DEPARTURE_MIN_SPEED
+      and lead.aLeadK >= 0.0
       and a_target >= 0.0
     )
     if not lead_valid:

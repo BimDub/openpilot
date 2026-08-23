@@ -11,6 +11,7 @@ from openpilot.cereal import messaging, custom, log
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import get_T_FOLLOW
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import DynamicExperimentalController
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
@@ -77,15 +78,29 @@ class LongitudinalPlannerSP:
                                  e2e: bool, force_decel: bool) -> float:
     finite = all(math.isfinite(value) for value in (gated, ungated, mpc_accel))
     coast_gate_changed_source = gated < mpc_accel <= ungated
+    cruise_accel = gated
     if (finite and not allow_throttle and not e2e and not force_decel
         and self._has_valid_selected_lead(sm, mpc_source) and coast_gate_changed_source):
-      return ungated
+      cruise_accel = ungated
 
-    return gated
+    lead_valid = (self.accel_controller.is_enabled() and self.source == LongitudinalPlanSource.cruise
+                  and self._has_valid_selected_lead(sm, mpc_source))
+    if not lead_valid or force_decel:
+      return cruise_accel
 
-  def update_lead_departure(self, sm: messaging.SubMaster, a_target: float, should_stop: bool, reset: bool) -> bool:
+    lead = sm['radarState'].leadOne if mpc_source == MpcPlanSource.lead0 else sm['radarState'].leadTwo
+    return self.accel_controller.get_lead_accel(
+      sm['carState'].vEgo, lead.dRel, lead.vRel, lead.aLeadK, cruise_accel, self.output_a_target,
+      get_T_FOLLOW(sm['selfdriveState'].personality),
+    )
+
+  def update_lead_departure(self, sm: messaging.SubMaster, a_target: float, should_stop: bool, reset: bool) -> tuple[float, bool]:
     radar_valid = sm.valid.get('radarState', False) and getattr(sm, 'alive', {}).get('radarState', False)
-    return self.lead_departure_controller.update(sm, self.mpc.source, a_target, should_stop, reset, radar_valid)
+    should_stop = self.lead_departure_controller.update(sm, self.mpc.source, a_target, should_stop, reset, radar_valid)
+    if self.lead_departure_controller.active:
+      lead = sm['radarState'].leadOne if self.mpc.source == MpcPlanSource.lead0 else sm['radarState'].leadTwo
+      a_target = self.accel_controller.get_lead_departure_accel(sm['carState'].vEgo, lead.vLeadK, lead.aLeadK, a_target)
+    return a_target, should_stop
 
   def update_targets(self, sm: messaging.SubMaster, v_ego: float, a_ego: float, v_cruise: float) -> tuple[float, float]:
     CS = sm['carState']

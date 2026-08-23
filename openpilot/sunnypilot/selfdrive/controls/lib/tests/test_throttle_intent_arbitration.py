@@ -8,32 +8,45 @@ See the LICENSE.md file in the root directory for more details.
 from types import SimpleNamespace
 from typing import cast
 
-from openpilot.cereal import messaging, log
+from openpilot.cereal import messaging, custom, log
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longitudinal_planner import get_coast_accel, get_cruise_accel
+from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import AccelController
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 
 PlanSource = log.LongitudinalPlan.LongitudinalPlanSource
+SunnyPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 
 
 class FakeSubMaster(dict):
   def __init__(self, lead_one: bool = True, lead_two: bool = False, *, valid: bool = True, alive: bool = True):
+    lead = {'dRel': 120.8, 'vRel': -16.4, 'aLeadK': -1.7}
     super().__init__(radarState=SimpleNamespace(
-      leadOne=SimpleNamespace(present=lead_one),
-      leadTwo=SimpleNamespace(present=lead_two),
-    ))
+      leadOne=SimpleNamespace(present=lead_one, **lead),
+      leadTwo=SimpleNamespace(present=lead_two, **lead),
+    ), carState=SimpleNamespace(vEgo=17.3),
+      selfdriveState=SimpleNamespace(personality=log.LongitudinalPersonality.standard))
     self.valid = {'radarState': valid}
     self.alive = {'radarState': alive}
 
 
 def arbitrate(sm, mpc_accel=0.19, gated_cruise=-0.26, ungated_cruise=0.5, source=PlanSource.lead0,
-              allow_throttle=False, e2e=False, force_decel=False):
-  planner = object.__new__(LongitudinalPlannerSP)
+              allow_throttle=False, e2e=False, force_decel=False, lead_comfort=False, previous_accel=0.0):
+  planner = make_planner(lead_comfort, previous_accel)
   return planner.arbitrate_cruise_candidate(
     cast(messaging.SubMaster, sm), gated_cruise, ungated_cruise, mpc_accel, source,
     allow_throttle=allow_throttle, e2e=e2e, force_decel=force_decel,
   )
+
+
+def make_planner(lead_comfort: bool = False, previous_accel: float = 0.0):
+  planner = object.__new__(LongitudinalPlannerSP)
+  planner.accel_controller = AccelController()
+  planner.accel_controller._enabled = lead_comfort
+  planner.source = SunnyPlanSource.cruise
+  planner.output_a_target = previous_accel
+  return planner
 
 
 class TestThrottleIntentArbitration(OpenpilotTestCase):
@@ -52,6 +65,22 @@ class TestThrottleIntentArbitration(OpenpilotTestCase):
     selected = arbitrate(FakeSubMaster(), mpc_accel=-0.6)
     self.assertEqual(selected, -0.26)
     self.assertEqual(min(selected, -0.6), -0.6)
+
+  def test_lead_comfort_is_only_an_extra_braking_candidate(self):
+    for sm, source in ((FakeSubMaster(), PlanSource.lead0), (FakeSubMaster(False, True), PlanSource.lead1)):
+      cruise = arbitrate(sm, mpc_accel=0.5, gated_cruise=0.5, ungated_cruise=0.5, source=source,
+                         allow_throttle=True, lead_comfort=True, previous_accel=0.2)
+      self.assertLess(cruise, 0.2)
+      self.assertEqual(min(cruise, -1.2), -1.2)
+
+  def test_lead_comfort_requires_a_live_selected_lead(self):
+    for sm, source in ((FakeSubMaster(valid=False), PlanSource.lead0),
+                       (FakeSubMaster(alive=False), PlanSource.lead0),
+                       (FakeSubMaster(lead_one=False), PlanSource.lead0),
+                       (FakeSubMaster(lead_one=True, lead_two=False), PlanSource.lead1)):
+      with self.subTest(source=source):
+        self.assertEqual(arbitrate(sm, gated_cruise=0.5, ungated_cruise=0.5, source=source,
+                                   allow_throttle=True, lead_comfort=True), 0.5)
 
   def test_policy_requires_live_valid_selected_lead(self):
     cases = (
@@ -90,7 +119,7 @@ class TestThrottleIntentArbitration(OpenpilotTestCase):
       steerRatio = 15.0
       wheelbase = 2.7
 
-    planner = object.__new__(LongitudinalPlannerSP)
+    planner = make_planner()
     sm = FakeSubMaster()
     v_ego = 6.9
     v_cruise = 30.0

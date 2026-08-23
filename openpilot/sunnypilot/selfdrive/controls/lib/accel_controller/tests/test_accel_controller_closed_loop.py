@@ -6,9 +6,11 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 from collections.abc import Callable
+from unittest import mock
 
 import numpy as np
 
+from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
@@ -18,7 +20,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import Longi
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import (
   AccelController, AccelProfile, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES, TARGET_SPEED_DEADBAND,
 )
-from openpilot.sunnypilot.selfdrive.test.longitudinal_maneuvers.plant import PlantSP
+from openpilot.sunnypilot.selfdrive.test.longitudinal_maneuvers.plant import PRIUS_TSS2_ROUTE_MODEL, PlantSP
 
 
 class CarParams:
@@ -57,7 +59,142 @@ def run_profile(profile: int, *, enabled: bool = True, speed: float = 0.0, v_cru
   return rows
 
 
+def run_vehicle_profile(profile: int, duration: float = 80.0):
+  params = Params()
+  params.put_bool("AccelPersonalityEnabled", True, block=True)
+  params.put("AccelPersonality", profile, block=True)
+
+  plant = PlantSP(speed=0.0, actuator_model=PRIUS_TSS2_ROUTE_MODEL, run_long_control=True)
+  _set_mpc_acceleration(plant)
+  rows = []
+  while plant.current_time < duration:
+    result = plant.step(v_cruise=25.0)
+    rows.append((plant.current_time, result["speed"], result["a_target"], result["actuator_command"], result["acceleration"]))
+  return np.asarray(rows)
+
+
+def run_lead_comfort(*, comfort_enabled: bool, speed: float, distance_lead: float,
+                     lead_speed_fn: Callable[[float], float], duration: float = 12.0):
+  params = Params()
+  params.put_bool("DynamicExperimentalControl", False, block=True)
+  params.put_bool("AccelPersonalityEnabled", True, block=True)
+  params.put("AccelPersonality", AccelProfile.eco, block=True)
+
+  plant = PlantSP(lead_relevancy=True, speed=speed, distance_lead=distance_lead, only_radar=True)
+  plant.v_lead_prev = lead_speed_fn(0.0)
+  planner = plant.planner
+  raw_mpc, raw_cruise, adjusted_cruise, rows = [], [], [], []
+  mpc_failures = 0
+  original_arbitrate = planner.arbitrate_cruise_candidate
+  original_lead_accel = planner.accel_controller.get_lead_accel
+  original_mpc_reset = planner.mpc.reset
+
+  def record_mpc_reset(*args, **kwargs):
+    nonlocal mpc_failures
+    mpc_failures += int(planner.mpc.solution_status != 0)
+    return original_mpc_reset(*args, **kwargs)
+
+  def record_arbitration(sm, gated, ungated, mpc_accel, mpc_source, **kwargs):
+    raw_mpc.append(mpc_accel)
+    return original_arbitrate(sm, gated, ungated, mpc_accel, mpc_source, **kwargs)
+
+  def record_lead_accel(v_ego, d_rel, v_rel, a_lead, a_target, previous_accel, t_follow):
+    raw_cruise.append(a_target)
+    adjusted = original_lead_accel(v_ego, d_rel, v_rel, a_lead, a_target, previous_accel, t_follow) if comfort_enabled else a_target
+    adjusted_cruise.append(adjusted)
+    return adjusted
+
+  with (
+    mock.patch.object(planner.mpc, "reset", side_effect=record_mpc_reset),
+    mock.patch.object(planner, "arbitrate_cruise_candidate", side_effect=record_arbitration),
+    mock.patch.object(planner.accel_controller, "get_lead_accel", side_effect=record_lead_accel),
+  ):
+    while plant.current_time < duration:
+      output = plant.step(v_lead=lead_speed_fn(plant.current_time), v_cruise=30.0)
+      rows.append((
+        output["distance_lead"] - output["distance"], output["actuator_command"], output["a_target"], output["fcw"], planner.mpc.solution_status,
+      ))
+
+  data = np.asarray(rows, dtype=float)
+  commands = data[:, 1]
+  braking_frames = np.flatnonzero(commands < -0.05)
+  return {
+    "min_gap": float(np.min(data[:, 0])),
+    "min_command": float(np.min(commands)),
+    "min_jerk": float(np.min(np.diff(commands) / DT_MDL)),
+    "first_brake_frame": int(braking_frames[0]) if len(braking_frames) else len(commands),
+    "a_targets": data[:, 2],
+    "fcw": bool(np.any(data[:, 3])),
+    "mpc_failures": mpc_failures + int(data[-1, 4] != 0),
+    "raw_mpc": np.asarray(raw_mpc),
+    "raw_cruise": np.asarray(raw_cruise),
+    "adjusted_cruise": np.asarray(adjusted_cruise),
+  }
+
+
 class TestAccelControllerClosedLoop(OpenpilotTestCase):
+  def test_profiles_are_immediate_smooth_and_clearly_distinct(self):
+    traces = {profile: run_vehicle_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)}
+
+    def crossing(trace, speed):
+      return float(trace[np.flatnonzero(trace[:, 1] >= speed)[0], 0])
+
+    time_to_20 = {profile: crossing(trace, 20.0 * CV.MPH_TO_MS) for profile, trace in traces.items()}
+    time_to_50 = {profile: crossing(trace, 50.0 * CV.MPH_TO_MS) for profile, trace in traces.items()}
+    first_motion = {profile: int(np.flatnonzero(trace[:, 1] > 0.01)[0]) for profile, trace in traces.items()}
+
+    self.assertEqual(len(set(first_motion.values())), 1)
+    self.assertTrue(all(trace[0, 2] > 0.0 and trace[1, 3] > 0.0 for trace in traces.values()))
+    self.assertGreaterEqual(time_to_20[AccelProfile.eco] - time_to_20[AccelProfile.normal], 2.0)
+    self.assertGreaterEqual(time_to_20[AccelProfile.normal] - time_to_20[AccelProfile.sport], 2.0)
+    self.assertGreaterEqual(time_to_50[AccelProfile.eco] - time_to_50[AccelProfile.normal], 10.0)
+    self.assertGreaterEqual(time_to_50[AccelProfile.normal] - time_to_50[AccelProfile.sport], 10.0)
+
+    for trace in traces.values():
+      command_jerk = np.abs(np.diff(trace[:, 3])) / DT_MDL
+      self.assertLessEqual(float(np.max(command_jerk)), PRIUS_TSS2_ROUTE_MODEL.command_rate_limit + 1e-9)
+
+      settled = np.flatnonzero(trace[:, 1] >= 25.0 - TARGET_SPEED_DEADBAND - 0.1)
+      self.assertGreater(len(settled), 0)
+      settled_trace = trace[settled[0]:]
+      self.assertGreaterEqual(float(np.min(settled_trace[:, 3])), -0.05)
+      self.assertGreaterEqual(float(np.min(np.diff(settled_trace[:, 1]))), -1e-8)
+      self.assertLessEqual(float(np.max(trace[:, 1])), 25.0 + 1e-9)
+      self.assertLessEqual(25.0 - float(trace[-1, 1]), TARGET_SPEED_DEADBAND + 0.02)
+
+  def test_lead_comfort_brakes_earlier_without_stronger_peak_for_slowing_lead(self):
+    def slowing_lead(t: float) -> float:
+      return float(np.clip(20.0 - 2.5 * max(t - 2.0, 0.0), 15.0, 20.0))
+
+    baseline = run_lead_comfort(comfort_enabled=False, speed=20.0, distance_lead=70.0, lead_speed_fn=slowing_lead)
+    comfort = run_lead_comfort(comfort_enabled=True, speed=20.0, distance_lead=70.0, lead_speed_fn=slowing_lead)
+
+    self.assertFalse(comfort["fcw"])
+    self.assertLessEqual(comfort["mpc_failures"], baseline["mpc_failures"])
+    self.assertGreater(comfort["min_gap"], 0.0)
+    self.assertGreaterEqual(comfort["min_gap"], baseline["min_gap"] - 0.1)
+    self.assertGreaterEqual(comfort["min_command"], baseline["min_command"] - 0.01)
+    self.assertGreaterEqual(comfort["min_jerk"], baseline["min_jerk"] - 0.05)
+    self.assertLessEqual(comfort["first_brake_frame"], baseline["first_brake_frame"])
+    self.assertTrue(np.all(comfort["a_targets"] <= comfort["raw_mpc"] + 1e-9))
+    self.assertTrue(np.all(comfort["adjusted_cruise"] <= comfort["raw_cruise"] + 1e-9))
+    self.assertTrue(np.any(comfort["adjusted_cruise"] < comfort["raw_cruise"] - 1e-3))
+
+  def test_lead_comfort_preserves_stopped_lead_safety(self):
+    def stopped_lead(_t: float) -> float:
+      return 0.0
+
+    baseline = run_lead_comfort(comfort_enabled=False, speed=20.0, distance_lead=90.0, lead_speed_fn=stopped_lead)
+    comfort = run_lead_comfort(comfort_enabled=True, speed=20.0, distance_lead=90.0, lead_speed_fn=stopped_lead)
+
+    self.assertFalse(comfort["fcw"])
+    self.assertLessEqual(comfort["mpc_failures"], baseline["mpc_failures"])
+    self.assertGreater(comfort["min_gap"], 0.0)
+    self.assertGreaterEqual(comfort["min_gap"], baseline["min_gap"] - 0.1)
+    self.assertGreaterEqual(comfort["min_command"], baseline["min_command"] - 0.01)
+    self.assertTrue(np.all(comfort["a_targets"] <= comfort["raw_mpc"] + 1e-9))
+    self.assertTrue(np.all(comfort["adjusted_cruise"] <= comfort["raw_cruise"] + 1e-9))
+
   def test_blended_positive_model_request_uses_profile_cruise_cap(self):
     params = Params()
     params.put_bool("DynamicExperimentalControl", False, block=True)
@@ -198,14 +335,10 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
 
     self.assertEqual(len(set(first_motion.values())), 1)
     self.assertTrue(all(frame == stock_first_motion for frame in first_motion.values()))
-    for rows in traces.values():
-      time_to_two = next(frame for frame, row in enumerate(rows) if row[0] >= 2.0) * DT_MDL
-      time_to_three = next(frame for frame, row in enumerate(rows) if row[0] >= 3.0) * DT_MDL
-      self.assertLessEqual(time_to_two, stock_time_to_two + DT_MDL)
-      self.assertLessEqual(time_to_three, stock_time_to_three + 0.1)
-    self.assertLessEqual(time_to_five[AccelProfile.sport], time_to_five[AccelProfile.normal])
-    self.assertLessEqual(time_to_five[AccelProfile.normal], time_to_five[AccelProfile.eco])
-    self.assertLessEqual(time_to_five[AccelProfile.eco], 1.25 * time_to_five[AccelProfile.normal])
+    self.assertLess(stock_time_to_two, next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 2.0) * DT_MDL)
+    self.assertLess(stock_time_to_three, next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 3.0) * DT_MDL)
+    self.assertGreaterEqual(time_to_five[AccelProfile.eco] - time_to_five[AccelProfile.normal], 0.5)
+    self.assertGreaterEqual(time_to_five[AccelProfile.normal] - time_to_five[AccelProfile.sport], 0.5)
 
   def test_road_speed_catchup_stays_useful(self):
     traces = {
@@ -213,8 +346,8 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
       for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)
     }
     gains = {profile: rows[-1][0] - 20.0 for profile, rows in traces.items()}
-    self.assertGreaterEqual(gains[AccelProfile.sport], gains[AccelProfile.normal])
-    self.assertGreaterEqual(gains[AccelProfile.eco], 0.72 * gains[AccelProfile.normal])
+    self.assertGreaterEqual(gains[AccelProfile.normal], 1.25 * gains[AccelProfile.eco])
+    self.assertGreaterEqual(gains[AccelProfile.sport], 1.25 * gains[AccelProfile.normal])
 
   def test_catchup_settles_inside_deadband_without_oscillation(self):
     target_speed = 24.0

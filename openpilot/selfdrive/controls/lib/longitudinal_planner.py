@@ -141,7 +141,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
                                               action_t=action_t)
     output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc)
-    output_should_stop_mpc = self.update_lead_departure(sm, output_a_target_mpc, output_should_stop_mpc, reset_state)
+    output_a_target_mpc, output_should_stop_mpc = self.update_lead_departure(sm, output_a_target_mpc, output_should_stop_mpc, reset_state)
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
