@@ -12,12 +12,11 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
-  A_CRUISE_MAX_BP, A_CRUISE_MIN, J_CRUISE_VALS, get_cruise_accel,
+  A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS, A_CRUISE_MIN, J_CRUISE_VALS, get_cruise_accel,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import (
-  AccelController, AccelProfile, CATCHUP_ACCEL_SCALE, CATCHUP_ERROR_BREAKPOINTS, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES,
-  MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES, TARGET_SPEED_APPROACH_FULL_SPEED, TARGET_SPEED_APPROACH_GAIN,
-  TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_WINDOW, TARGET_SPEED_DEADBAND,
+  AccelController, AccelProfile, COMFORT_JERK, LAUNCH_FLOOR_VALUES, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES,
+  TARGET_SPEED_DEADBAND,
 )
 
 
@@ -58,15 +57,32 @@ class TestAccelController(OpenpilotTestCase):
       for speed in np.linspace(0.0, 55.0, 551):
         assert controller.get_max_accel(speed) <= ACCEL_MAX
 
-  def test_min_accel_bpv_is_profile_independent_and_within_stock_cruise_floor(self):
-    controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
-    for speed, expected in zip(MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES, strict=True):
-      assert all(controller.get_min_accel(speed) == expected for controller in controllers)
+  def test_decel_reaches_stock_parity_above_profile_crossover(self):
+    # The comfort law is deliberately unbounded below - stock's own clip to A_CRUISE_MIN owns the decel floor,
+    # which means every profile converges on stock authority once the law's peak reaches it, at
+    # |dv| = A_CRUISE_MIN**2 / J + deadband. Below that the law is gentler on purpose; at or above it the
+    # command must be bit-identical to stock. A decel cap of any kind breaks the second half, and lowering J
+    # pushes the crossover out, so this test is what keeps "never brake less than stock" honest.
+    for profile, jerk in COMFORT_JERK.items():
+      controller = self.set_profile(profile)
+      crossover = A_CRUISE_MIN ** 2 / jerk + TARGET_SPEED_DEADBAND
+      for v_ego in (20.0, 29.0, 40.0):
+        cap = controller.get_max_accel(v_ego)
+        args = (v_ego, A_CRUISE_MIN, 0.0, _fake_cp(), 10.0, 0.0, True, cap)
 
-    values = np.asarray([controllers[0].get_min_accel(speed) for speed in np.linspace(0.0, 55.0, 551)])
-    assert np.all(values >= A_CRUISE_MIN)
-    assert np.all(values < 0.0)
-    assert np.all(np.diff(values) <= 1e-12)
+        for drop in (crossover * 1.001, crossover + 1.0, crossover + 10.0):
+          v_target = v_ego - drop
+          if v_target <= 0.1:
+            continue
+          shaped = controller.get_cruise_target(v_ego, v_target)
+          assert get_cruise_accel(False, shaped, *args) == get_cruise_accel(False, v_target, *args), (profile, v_ego, drop)
+
+        # Below the crossover the law softens, but only ever down to the constant-jerk value.
+        for drop in (crossover * 0.5, crossover * 0.25):
+          v_target = v_ego - drop
+          expected = -np.sqrt(jerk * (drop - TARGET_SPEED_DEADBAND))
+          assert np.isclose(controller.get_comfort_accel(v_ego, v_target), expected), (profile, drop)
+          assert expected > A_CRUISE_MIN, (profile, drop)
 
   def test_profiles_have_material_separation(self):
     controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
@@ -77,13 +93,23 @@ class TestAccelController(OpenpilotTestCase):
     for speed in MAX_ACCEL_BREAKPOINTS[1:-1]:
       assert controllers[2].get_max_accel(speed) - controllers[0].get_max_accel(speed) >= 0.3 - 1e-12
 
-  def test_profiles_taper_to_gentle_highway_acceleration(self):
-    controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
-    for speed in np.linspace(25.0, 40.0, 151):
-      eco, normal, sport = (controller.get_max_accel(speed) for controller in controllers)
-      assert eco <= 0.35
-      assert normal <= 0.48
-      assert sport <= 0.68
+  def test_profiles_keep_usable_road_speed_acceleration(self):
+    # A previous revision had eco at 0.20 m/s^2 at 40 m/s. 1% of road grade costs 0.098 m/s^2 of gravity, so
+    # that profile cannot hold speed on anything steeper than ~2% and can never recover once it bleeds off.
+    # This is a LOWER bound on purpose: the tapered upper bounds it replaces let highway accel go to zero.
+    controllers = {profile: self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)}
+    for speed in np.linspace(8.0, 40.0, 321):
+      stock = float(np.interp(speed, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS))
+      values = {profile: controller.get_max_accel(speed) for profile, controller in controllers.items()}
+      # 0.35 m/s^2 holds a 3% grade; the fractions keep merges and passes usable.
+      assert values[AccelProfile.eco] >= max(0.35, 0.60 * stock), speed
+      assert values[AccelProfile.normal] >= 0.80 * stock, speed
+      assert values[AccelProfile.sport] >= stock, speed
+
+  def test_eco_never_exceeds_stock(self):
+    controller = self.set_profile(AccelProfile.eco)
+    for speed in np.linspace(0.0, 55.0, 551):
+      assert controller.get_max_accel(speed) <= float(np.interp(speed, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)) + 1e-12, speed
 
   def test_comfort_profile_caps_taper_after_launch(self):
     for profile in (AccelProfile.eco, AccelProfile.normal):
@@ -95,75 +121,75 @@ class TestAccelController(OpenpilotTestCase):
     assert controller.get_max_accel(0.0) == ACCEL_MAX
     assert all(controller.get_max_accel(speed) <= ACCEL_MAX for speed in np.linspace(0.0, 55.0, 551))
 
-  def test_positive_catchup_limit_is_continuous_and_monotonic(self):
+  def test_comfort_accel_is_continuous_and_monotonic(self):
+    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+      controller = self.set_profile(profile)
+      for v_ego in (0.0, 5.0, 20.0, 40.0):
+        envelope = controller.get_max_accel(v_ego)
+        errors = np.linspace(-12.0, 12.0, 961)
+        accels = np.asarray([controller.get_comfort_accel(v_ego, v_ego + error) for error in errors])
+
+        assert np.all(np.isfinite(accels))
+        assert np.all(np.diff(accels) >= -1e-9), (profile, v_ego)  # monotone in the signed error
+        assert np.all(np.abs(accels) <= np.abs(errors) + 1e-12)  # never asks for more than the error itself
+        assert np.all(accels <= envelope + 1e-12)  # the accel side is envelope-bounded
+        assert np.all(accels[errors < 0.0] <= 0.0) and np.all(accels[errors > 0.0] >= 0.0)  # sign is correct
+
+  def test_comfort_accel_matches_the_constant_jerk_closed_form(self):
+    # The law is min(error, sqrt(J * error)) on the deadbanded error. The linear term wins below error == J
+    # and keeps the slope finite at the deadband edge, where sqrt is vertical; the sqrt term wins above it.
+    # Asserted in closed form so nobody "optimises" the min() away.
+    for profile, jerk in COMFORT_JERK.items():
+      controller = self.set_profile(profile)
+      v_ego = 25.0
+      for error in (jerk / 2.0, jerk, jerk * 2.0, 1.0, 3.0, 9.0):
+        expected = min(error, np.sqrt(jerk * error))
+        assert np.isclose(controller.get_comfort_accel(v_ego, v_ego - error - TARGET_SPEED_DEADBAND), -expected), (profile, error)
+
+      # Continuity across the crossover.
+      crossover = jerk + TARGET_SPEED_DEADBAND
+      below = controller.get_comfort_accel(v_ego, v_ego - crossover + 1e-6)
+      above = controller.get_comfort_accel(v_ego, v_ego - crossover - 1e-6)
+      assert abs(above - below) < 1e-5, profile
+
+  def test_comfort_accel_deadband_is_exact(self):
+    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+      controller = self.set_profile(profile)
+      for error in (0.0, 0.1, TARGET_SPEED_DEADBAND, -0.1, -TARGET_SPEED_DEADBAND):
+        assert controller.get_comfort_accel(20.0, 20.0 + error) == 0.0, (profile, error)
+      assert controller.get_comfort_accel(20.0, float("nan")) == 0.0
+
+  def test_launch_floor_guarantees_breakaway_authority(self):
+    # sqrt(J * dv) toward a small target is below the powertrain's breakaway acceleration, so without a floor
+    # the car would sit still at a green light behind a creeping lead. The floor must not exceed the error.
+    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+      controller = self.set_profile(profile)
+      for target in np.linspace(1.0, 30.0, 59):
+        accel = controller.get_comfort_accel(0.0, target)
+        assert accel >= min(LAUNCH_FLOOR_VALUES[0], target - TARGET_SPEED_DEADBAND) - 1e-12, (profile, target)
+        assert accel <= target - TARGET_SPEED_DEADBAND + 1e-12, (profile, target)
+
+  def test_cruise_target_passes_through_degenerate_targets(self):
+    # v_target <= 0 is how force_decel reaches this hook (the stock planner zeroes v_cruise), so it must
+    # never be reshaped. Non-finite targets must not propagate NaN into the cruise accel either.
     controller = self.set_profile(AccelProfile.normal)
     v_ego = 20.0
-    max_accel = controller.get_max_accel(v_ego)
-    errors = np.linspace(1e-4, 8.0, 321)
-    accel_limits = np.asarray([controller.get_max_accel(v_ego, v_ego + error) for error in errors])
 
-    assert np.all(np.isfinite(accel_limits))
-    assert np.all(np.diff(accel_limits) >= -1e-12)
-    assert np.all(accel_limits <= errors + 1e-12)
-    assert np.all(accel_limits <= max_accel + 1e-12)
-    assert controller.get_max_accel(v_ego, v_ego + TARGET_SPEED_DEADBAND) == 0.0
-    assert np.isclose(controller.get_max_accel(v_ego, v_ego + CATCHUP_ERROR_BREAKPOINTS[-1]), max_accel)
-
-    for error, scale in zip(CATCHUP_ERROR_BREAKPOINTS, CATCHUP_ACCEL_SCALE, strict=True):
-      expected_accel = min(error, max_accel * scale)
-      assert np.isclose(controller.get_max_accel(v_ego, v_ego + error), expected_accel)
-      below = controller.get_max_accel(v_ego, v_ego + error - 1e-6)
-      above = controller.get_max_accel(v_ego, v_ego + error + 1e-6)
-      assert above >= below
-      assert above - below < 1e-4
-
-  def test_nonfinite_target_uses_profile_cap(self):
-    controller = self.set_profile(AccelProfile.normal)
-    base_limit = controller.get_max_accel(20.0)
-    for target in (float("nan"), float("inf"), -float("inf")):
-      assert controller.get_max_accel(20.0, target) == base_limit
-
-  def test_cruise_decel_settling_is_continuous(self):
-    controller = self.set_profile(AccelProfile.normal)
-    v_ego = 20.0
-    near_error = 0.5
-    target_blend = (TARGET_SPEED_APPROACH_WINDOW - near_error) / (TARGET_SPEED_APPROACH_WINDOW - TARGET_SPEED_DEADBAND)
-    adjusted_error = near_error - TARGET_SPEED_DEADBAND * target_blend
-    gain = 1.0 - (1.0 - TARGET_SPEED_APPROACH_GAIN) * target_blend
-    expected_error = adjusted_error * gain
-
-    assert np.isclose(controller.get_cruise_target(v_ego, v_ego - near_error), v_ego - expected_error)
-    assert controller.get_cruise_target(v_ego, v_ego - TARGET_SPEED_DEADBAND) == v_ego
-    assert controller.get_cruise_target(v_ego, v_ego - TARGET_SPEED_APPROACH_WINDOW) == v_ego - TARGET_SPEED_APPROACH_WINDOW
-
-    errors = np.linspace(-5.0, 0.0, 201)
-    shaped_errors = np.asarray([controller.get_cruise_target(v_ego, v_ego + error) - v_ego for error in errors])
-    assert np.all(np.isfinite(shaped_errors))
-    assert np.all(np.diff(shaped_errors) >= 0.0)
-    assert np.all(np.abs(shaped_errors) <= np.abs(errors) + 1e-12)
-
-  def test_comfort_decel_caps_only_negative_positive_speed_targets(self):
-    controller = self.set_profile(AccelProfile.normal)
-    v_ego = 20.0
-    min_accel = controller.get_min_accel(v_ego)
-
-    assert controller.get_cruise_target(v_ego, 15.0) == 15.0
-    assert np.isclose(controller.get_cruise_target(v_ego, 15.0, comfort_decel=True), v_ego + min_accel)
-    assert controller.get_cruise_target(v_ego, 25.0, comfort_decel=True) == 25.0
-    assert controller.get_cruise_target(v_ego, 0.0, comfort_decel=True) == 0.0
-    assert np.isnan(controller.get_cruise_target(v_ego, float("nan"), comfort_decel=True))
-    assert controller.get_cruise_target(v_ego, float("inf"), comfort_decel=True) == float("inf")
-
-    errors = np.linspace(-5.0, -1e-4, 501)
-    shaped = np.asarray([controller.get_cruise_target(v_ego, v_ego + error, comfort_decel=True) - v_ego for error in errors])
-    assert np.all(np.isfinite(shaped))
-    assert np.all(shaped >= min_accel - 1e-12)
-    assert np.all(np.diff(shaped) >= -1e-12)
+    assert controller.get_cruise_target(v_ego, 0.0) == 0.0
+    assert controller.get_cruise_target(v_ego, -1.0) == -1.0
+    assert np.isnan(controller.get_cruise_target(v_ego, float("nan")))
+    assert controller.get_cruise_target(v_ego, float("inf")) == float("inf")
 
   def test_lead_departure_accel_is_bounded_by_lead_speed_and_profile(self):
+    # Chasing a lead crawling at 2 m/s used to command the full standstill envelope. The comfort law bounds
+    # it by the closing rate and the launch floor instead, which is enough to break away and no more.
     controller = self.set_profile(AccelProfile.eco)
-    assert controller.get_lead_departure_accel(0.0, 0.7, 0.1, 0.1) == 0.7
-    assert controller.get_lead_departure_accel(0.0, 2.0, 0.1, 0.1) == MAX_ACCEL_PROFILES[AccelProfile.eco][0]
+    assert np.isclose(controller.get_lead_departure_accel(0.0, 0.7, 0.1, 0.1), 0.5)
+    assert np.isclose(controller.get_lead_departure_accel(0.0, 2.0, 0.1, 0.1), LAUNCH_FLOOR_VALUES[0])
+
+    for v_lead in np.linspace(0.3, 6.0, 58):
+      accel = controller.get_lead_departure_accel(0.0, v_lead, 0.1, -1.0)
+      assert accel <= v_lead + 1e-12, v_lead  # never faster than the lead is pulling away
 
   def test_lead_departure_accel_preserves_non_acceleration_cases(self):
     controller = self.set_profile(AccelProfile.normal)
@@ -175,29 +201,24 @@ class TestAccelController(OpenpilotTestCase):
     self.params.put_bool("AccelPersonalityEnabled", False, block=True)
     assert AccelController().get_lead_departure_accel(0.0, 1.0, 0.1, 0.1) == 0.1
 
-  def test_catchup_limit_does_not_touch_launch(self):
-    controller = self.set_profile(AccelProfile.sport)
+  def test_composed_cruise_command_is_lipschitz_in_speed(self):
+    # The shaped target and the ceiling are both functions of v_ego, so a discontinuity in either shows up as
+    # a step in the commanded acceleration. dt=10 makes the stock jerk limiter a no-op so nothing can hide a
+    # step. The law's steepest branch is the linear one, whose slope in v_ego is exactly 1, so the bound is
+    # the sample spacing - anything above that is a genuine jump.
+    for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+      controller = self.set_profile(profile)
 
-    def command(speed: float, target: float, dynamic: bool = True) -> float:
-      max_accel = controller.get_max_accel(speed, target) if dynamic else controller.get_max_accel(speed)
-      return get_cruise_accel(False, target, speed, 0.0, 0.0, _fake_cp(), 10.0, 0.0, True, max_accel)
+      def command(speed: float, target: float, ctrl: AccelController = controller) -> float:
+        shaped = ctrl.get_cruise_target(speed, target)
+        return get_cruise_accel(False, shaped, speed, 0.0, 0.0, _fake_cp(), 10.0, 0.0, True, ctrl.get_max_accel(speed))
 
-    for speed in np.linspace(0.0, TARGET_SPEED_APPROACH_MIN_SPEED, 101):
-      for target in (0.0, 8.0, 30.0):
-        assert command(speed, target) == command(speed, target, dynamic=False)
-
-    below = command(TARGET_SPEED_APPROACH_MIN_SPEED - 1e-3, TARGET_SPEED_APPROACH_MIN_SPEED + 0.5 - 1e-3)
-    at = command(TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_MIN_SPEED + 0.5)
-    above = command(TARGET_SPEED_APPROACH_MIN_SPEED + 1e-3, TARGET_SPEED_APPROACH_MIN_SPEED + 0.5 + 1e-3)
-    assert np.isclose(below, 0.5)
-    assert np.isclose(at, 0.5)
-    assert abs(above - at) < 1e-3
-
-    below_full = command(TARGET_SPEED_APPROACH_FULL_SPEED - 1e-3, TARGET_SPEED_APPROACH_FULL_SPEED + 0.5 - 1e-3)
-    at_full = command(TARGET_SPEED_APPROACH_FULL_SPEED, TARGET_SPEED_APPROACH_FULL_SPEED + 0.5)
-    above_full = command(TARGET_SPEED_APPROACH_FULL_SPEED + 1e-3, TARGET_SPEED_APPROACH_FULL_SPEED + 0.5 + 1e-3)
-    assert abs(below_full - at_full) < 1e-3
-    assert abs(above_full - at_full) < 1e-3
+      for target in (2.0, 8.0, 30.0):
+        speeds = np.linspace(0.0, min(target + 4.0, 45.0), 451)
+        spacing = float(speeds[1] - speeds[0])
+        commands = np.asarray([command(speed, target) for speed in speeds])
+        assert np.all(np.isfinite(commands)), (profile, target)
+        assert np.all(np.abs(np.diff(commands)) <= spacing * 1.05 + 1e-9), (profile, target)
 
   def test_cruise_target_deadband_removes_small_sign_flips(self):
     controller = self.set_profile(AccelProfile.normal)
@@ -207,7 +228,7 @@ class TestAccelController(OpenpilotTestCase):
     for error in errors:
       raw_target = v_ego + error
       target = controller.get_cruise_target(v_ego, raw_target)
-      max_accel = controller.get_max_accel(v_ego, raw_target)
+      max_accel = controller.get_max_accel(v_ego)
       commands.append(get_cruise_accel(False, target, v_ego, 0.0, 0.0, _fake_cp(), 10.0, 0.0, True, max_accel))
     shaped = np.asarray(commands)
 
@@ -249,6 +270,23 @@ class TestPlannerIntegration(OpenpilotTestCase):
     self.params = Params()
     self.params.put_bool("AccelPersonalityEnabled", False, block=True)
 
+  def test_stock_cruise_law_is_unit_time_constant(self):
+    # get_cruise_target reshapes a SPEED, but the value it returns is v_ego + a_desired. That only commands
+    # a_desired because stock's cruise law reads a speed error in m/s directly as an acceleration in m/s^2:
+    # target_accel = clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel). It is a proportional law with a 1.0 s
+    # time constant, and that constant is what the fork's target shaping is inverting.
+    #
+    # dt=100 with a_cruise_prev=a makes the stock jerk limiter a no-op; angle_steers=0 and allow_throttle=True
+    # make the turn and coast limits no-ops; |a| <= 1.2 stays off the A_CRUISE_MIN clip. So this isolates the
+    # one line the inversion depends on.
+    #
+    # If this fails, openpilot changed the cruise law. Re-derive the time constant before shipping anything
+    # that relies on the inversion - the failure is otherwise silent, just wrong feel.
+    for v_ego in (5.0, 20.0, 35.0):
+      for a in (-1.2, -0.5, -0.1, 0.0, 0.1, 0.5, 1.2):
+        got = get_cruise_accel(False, v_ego + a, v_ego, a, 0.0, _fake_cp(), 100.0, 0.0, True, 2.0)
+        assert np.isclose(got, a), (v_ego, a, got)
+
   def test_none_override_matches_stock(self):
     for e2e in (False, True):
       for allow_throttle in (False, True):
@@ -276,13 +314,18 @@ class TestPlannerIntegration(OpenpilotTestCase):
     speed = 20.0
     speed_errors = (4.0, 3.0, 2.0, 1.0, 0.5, TARGET_SPEED_DEADBAND)
     targets = [controller.get_cruise_target(speed, speed + error) for error in speed_errors]
-    max_accels = [controller.get_max_accel(speed, speed + error) for error in speed_errors]
+    max_accels = [controller.get_max_accel(speed) for _ in speed_errors]
     accels = [get_cruise_accel(False, target, speed, 0.0, 0.0, _fake_cp(), 10.0, 0.0, True, max_accel)
               for target, max_accel in zip(targets, max_accels, strict=True)]
 
-    assert np.isclose(accels[0], controller.get_max_accel(speed))
-    assert accels[1] < controller.get_max_accel(speed)
-    assert all(current > following for current, following in zip(accels, accels[1:], strict=False))
+    # The taper now comes from the shaped target rather than from the ceiling. Large errors saturate on the
+    # envelope (so they tie), and the law takes over below it - monotone throughout, landing exactly on zero.
+    envelope = controller.get_max_accel(speed)
+    assert accels[0] <= envelope + 1e-12
+    assert all(current >= following for current, following in zip(accels, accels[1:], strict=False))
+    off_envelope = [accel for accel in accels if accel < envelope - 1e-12]
+    assert len(off_envelope) >= 3
+    assert all(current > following for current, following in zip(off_envelope, off_envelope[1:], strict=False))
     assert accels[-1] == 0.0
 
   def test_disabled_leaves_stock_limit_active(self):
@@ -322,64 +365,63 @@ class TestPlannerIntegration(OpenpilotTestCase):
 
     self.params.put_bool("AccelPersonalityEnabled", True, block=True)
     planner = _bare_planner()
-    expected_limit = planner.accel_controller.get_max_accel(20.0, 20.5)
+    expected_limit = planner.accel_controller.get_max_accel(20.0)
+    expected_accel_target = planner.accel_controller.get_cruise_target(20.0, 20.5)
     expected_decel_target = planner.accel_controller.get_cruise_target(20.5, 20.0)
-    assert planner.get_cruise_target_override(20.0, 20.5, e2e=False) == 20.5
+    assert np.isclose(planner.get_cruise_target_override(20.0, 20.5, e2e=False), expected_accel_target)
     assert np.isclose(planner.get_cruise_target_override(20.5, 20.0, e2e=False), expected_decel_target)
     assert np.isclose(planner.get_max_accel_override(20.0, 20.5, e2e=False), expected_limit)
 
+    # Without throttle authority the accelerating half must not be shaped at all - shaping it would command
+    # gas the throttle-intent gate has just suppressed. The decelerating half is still shaped.
     planner.allow_throttle = False
     assert planner.get_cruise_target_override(20.0, 20.5, e2e=False) == 20.5
+    assert np.isclose(planner.get_cruise_target_override(20.5, 20.0, e2e=False), expected_decel_target)
     assert planner.get_max_accel_override(20.0, 20.5, e2e=False) is None
     assert planner.accel_controller_active is False
-    assert planner.get_cruise_target_override(20.0, 20.5, e2e=True) == 20.5
+    assert np.isclose(planner.get_cruise_target_override(20.0, 20.5, e2e=True), expected_accel_target)
     assert np.isclose(planner.get_max_accel_override(20.0, 20.5, e2e=True), expected_limit)
     assert planner.accel_controller_active is True
 
     planner.source = LongitudinalPlanSource.sccVision
     assert planner.get_cruise_target_override(20.0, 20.5, e2e=True) == 20.5
-    assert np.isclose(planner.get_max_accel_override(20.0, 20.5, e2e=True), expected_limit)
+    assert np.isclose(planner.get_max_accel_override(20.0, 20.5, e2e=True), planner.accel_controller.get_max_accel(20.0))
 
-  def test_comfort_decel_is_ordinary_cruise_only(self):
-    from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanSource
+  def test_scc_and_sla_sources_are_never_softened(self):
+    # SCC derives its target from a lateral-acceleration budget and the curve is at a fixed distance, so
+    # stretching the maneuver means arriving faster than the budget allows. SLA has the same shape of
+    # constraint against the sign's position. Only a pure-preference target may be reshaped.
+    # This test is what stops a future change from adding either to COMFORT_SOURCES.
+    from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import COMFORT_SOURCES, LongitudinalPlanSource
+
+    assert COMFORT_SOURCES == (LongitudinalPlanSource.cruise,)
 
     self.params.put_bool("AccelPersonalityEnabled", True, block=True)
     planner = _bare_planner()
-    speed = 20.0
-    target = 15.0
-    expected = planner.accel_controller.get_cruise_target(speed, target, comfort_decel=True)
-
-    for allow_throttle in (False, True):
-      planner.allow_throttle = allow_throttle
-      planner.accel_controller_active = False
-      assert planner.get_cruise_target_override(speed, target, e2e=False) == expected
-      assert planner.accel_controller_active
-
-    planner.accel_controller_active = False
-    assert planner.get_cruise_target_override(speed, target, e2e=True) == target
-    assert not planner.accel_controller_active
+    speed = 29.0
 
     for source in (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap, LongitudinalPlanSource.speedLimitAssist):
       planner.source = source
-      assert planner.get_cruise_target_override(speed, target, e2e=False) == target
+      for target in (20.0, 25.0, 28.5, 30.0, 33.0):
+        assert planner.get_cruise_target_override(speed, target, e2e=False) == target, (source, target)
+      # The ceiling is speed-scheduled only, so it is the same for every source.
+      assert np.isclose(planner.get_max_accel_override(speed, 33.0, e2e=False), planner.accel_controller.get_max_accel(speed))
 
-    planner.source = LongitudinalPlanSource.cruise
+  def test_force_decel_is_never_softened(self):
+    # forceDecel is captured explicitly in update(). The stock planner also zeroes v_cruise, and the
+    # v_target <= 0 guard catches that, but relying on an exact float reaching this class is too fragile a
+    # guard for a path that must never be softened - so both are asserted.
+    self.params.put_bool("AccelPersonalityEnabled", True, block=True)
+    planner = _bare_planner()
+    speed = 29.0
+
+    planner.force_decel = True
+    for target in (0.0, 5.0, 20.0, 28.9, 33.0):
+      assert planner.get_cruise_target_override(speed, target, e2e=False) == target, target
+
+    planner.force_decel = False
     assert planner.get_cruise_target_override(speed, 0.0, e2e=False) == 0.0
-
-  def test_selected_sunnypilot_target_uses_catchup_taper(self):
-    from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanSource
-
-    self.params.put_bool("AccelPersonalityEnabled", True, block=True)
-    planner = _bare_planner()
-    speed = 32.0
-    target = speed + 1.4
-    base_limit = planner.accel_controller.get_max_accel(speed)
-    tapered_limit = planner.accel_controller.get_max_accel(speed, target)
-
-    assert tapered_limit < base_limit
-    for source in (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap, LongitudinalPlanSource.speedLimitAssist):
-      planner.source = source
-      assert np.isclose(planner.get_max_accel_override(speed, target, e2e=False), tapered_limit)
+    assert planner.get_cruise_target_override(speed, 20.0, e2e=False) != 20.0
 
 
 def _fake_cp():
@@ -397,5 +439,6 @@ def _bare_planner():
   planner.accel_controller = AccelController()
   planner.accel_controller_active = False
   planner.allow_throttle = True
+  planner.force_decel = False
   planner.source = LongitudinalPlanSource.cruise
   return planner

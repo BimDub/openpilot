@@ -26,6 +26,22 @@ DecState = custom.LongitudinalPlanSP.DynamicExperimentalControl.DynamicExperimen
 LongitudinalPlanSource = custom.LongitudinalPlanSP.LongitudinalPlanSource
 MpcPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 
+# openpilot's get_cruise_accel() computes target_accel = clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel),
+# i.e. it reads a speed error in m/s directly as an acceleration in m/s^2 - a proportional law with a 1.0 s
+# time constant. Inverting it lets the comfort law drive the cruise acceleration target with zero edits to
+# stock. LOCKED BY test_stock_cruise_law_is_unit_time_constant: if that fails, openpilot changed the law and
+# this constant must be re-derived before shipping, because the failure is otherwise silent.
+STOCK_CRUISE_ACCEL_TIME_CONSTANT = 1.0  # s
+
+# Sources whose target is pure driver preference, with no distance or lateral-acceleration deadline behind
+# it, and therefore safe to stretch into a longer comfort maneuver.
+#
+# speedLimitAssist has a soft deadline (the sign is at a fixed place) - a candidate, but only with a
+# distance-aware floor. sccVision/sccMap must NEVER be added: their target comes from a lateral-acceleration
+# budget and the curve is at a fixed distance, so stretching the maneuver means arriving faster than the
+# budget allows.
+COMFORT_SOURCES = (LongitudinalPlanSource.cruise,)
+
 
 class LongitudinalPlannerSP:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
@@ -41,6 +57,7 @@ class LongitudinalPlannerSP:
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
     self.source = LongitudinalPlanSource.cruise
     self.e2e_alerts_helper = E2EAlertsHelper()
+    self.force_decel = False
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -52,21 +69,22 @@ class LongitudinalPlannerSP:
 
     return experimental_mode and self.dec.mode() == "blended"
 
-  def get_max_accel_override(self, v_ego: float, v_target: float, e2e: bool) -> float | None:
+  def get_max_accel_override(self, v_ego: float, _v_target: float, e2e: bool) -> float | None:
+    """Pure speed-scheduled authority. The arrival taper is the comfort law's job, not the ceiling's."""
     self.accel_controller_active = bool(self.accel_controller.is_enabled() and (e2e or self.allow_throttle))
     if not self.accel_controller_active:
       return None
-    return self.accel_controller.get_max_accel(v_ego, v_target)
+    return self.accel_controller.get_max_accel(v_ego)
 
   def get_cruise_target_override(self, v_ego: float, v_target: float, e2e: bool) -> float:
-    if not self.accel_controller.is_enabled() or self.source != LongitudinalPlanSource.cruise:
+    if not self.accel_controller.is_enabled() or self.force_decel or self.source not in COMFORT_SOURCES:
       return v_target
 
-    comfort_decel = not e2e and 0.0 < v_target < v_ego
-    if not comfort_decel and not (e2e or self.allow_throttle):
+    # Only the accelerating half needs throttle authority; a gentler approach to a lower target does not.
+    if v_target >= v_ego and not (e2e or self.allow_throttle):
       return v_target
 
-    target = self.accel_controller.get_cruise_target(v_ego, v_target, comfort_decel=comfort_decel)
+    target = self.accel_controller.get_cruise_target(v_ego, v_target)
     self.accel_controller_active |= bool(math.isfinite(target) and target != v_target)
     return target
 
@@ -129,6 +147,9 @@ class LongitudinalPlannerSP:
 
   def update(self, sm: messaging.SubMaster) -> None:
     self.accel_controller.update()
+    # Captured explicitly rather than inferred from the stock planner zeroing v_cruise: relying on an exact
+    # float 0.0 reaching this class is too fragile a guard for a path that must never be softened.
+    self.force_decel = bool(sm['controlsState'].forceDecel)
     self.events_sp.clear()
     self.e2e_alerts_helper.update(sm, self.events_sp)
 

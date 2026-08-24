@@ -39,21 +39,24 @@ def _set_mpc_acceleration(plant: PlantSP, acceleration: float = 2.0) -> None:
 
 
 def run_profile(profile: int, *, enabled: bool = True, speed: float = 0.0, v_cruise: float = 30.0,
-                v_cruise_fn: Callable[[int], float] | None = None, e2e: bool = False, steps: int = 120):
+                v_cruise_fn: Callable[[int], float] | None = None, e2e: bool = False, steps: int = 120,
+                speed_noise: float = 0.0, seed: int = 0):
   params = Params()
   params.put_bool("AccelPersonalityEnabled", enabled, block=True)
   params.put("AccelPersonality", profile, block=True)
   controller = AccelController()
+  rng = np.random.default_rng(seed)
 
   accel = 0.0
   rows = []
   for frame in range(steps):
     target_speed = v_cruise if v_cruise_fn is None else v_cruise_fn(frame)
     use_profile = controller.is_enabled()
-    comfort_decel = not e2e and 0.0 < target_speed < speed
-    cruise_target = controller.get_cruise_target(speed, target_speed, comfort_decel=comfort_decel) if use_profile else target_speed
-    max_accel_override = controller.get_max_accel(speed, target_speed) if use_profile else None
-    accel = get_cruise_accel(e2e, cruise_target, speed, accel, 0.0, CarParams(), DT_MDL, 2.0, True, max_accel_override)
+    # The controller only ever sees a measured vEgo, so noise on it is what drives hunting.
+    measured = speed + (float(rng.normal(0.0, speed_noise)) if speed_noise else 0.0)
+    cruise_target = controller.get_cruise_target(measured, target_speed) if use_profile else target_speed
+    max_accel_override = controller.get_max_accel(measured) if use_profile else None
+    accel = get_cruise_accel(e2e, cruise_target, measured, accel, 0.0, CarParams(), DT_MDL, 2.0, True, max_accel_override)
     speed = max(0.0, speed + accel * DT_MDL)
     rows.append((speed, accel, should_stop(speed, accel)))
   return rows
@@ -211,16 +214,24 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
       for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
         self.assertEqual(run_profile(profile, speed=20.0, v_cruise=0.0, e2e=e2e, steps=100), stock)
 
-  def test_comfort_cruise_decel_is_gentle_smooth_and_profile_independent(self):
+  def test_cruise_decel_is_gentle_smooth_and_profile_ordered(self):
+    # A 5 m/s drop sits below eco's and normal's stock-parity crossover (9.8 and 6.0 m/s) and above sport's
+    # (4.0), so this is the case that shows the whole design at once: eco softest, normal in between, sport
+    # already converged on stock authority. Deceleration is profile-dependent by design now - a previous
+    # revision asserted it was profile-independent, which is what a magnitude-only table gives you.
     stock = run_profile(AccelProfile.normal, enabled=False, speed=25.0, v_cruise=20.0, steps=220)
     traces = {
       profile: run_profile(profile, speed=25.0, v_cruise=20.0, steps=220)
       for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)
     }
+    peaks = {profile: min(row[1] for row in trace) for profile, trace in traces.items()}
+    stock_peak = min(row[1] for row in stock)
 
-    self.assertEqual(traces[AccelProfile.eco], traces[AccelProfile.normal])
-    self.assertEqual(traces[AccelProfile.normal], traces[AccelProfile.sport])
-    self.assertGreater(min(row[1] for row in traces[AccelProfile.normal]), min(row[1] for row in stock))
+    self.assertGreater(peaks[AccelProfile.eco], peaks[AccelProfile.normal])
+    self.assertGreater(peaks[AccelProfile.normal], peaks[AccelProfile.sport])
+    self.assertEqual(peaks[AccelProfile.sport], stock_peak)
+    for profile, peak in peaks.items():
+      self.assertGreaterEqual(peak, stock_peak, profile)  # never firmer than stock authority
 
     previous_speed = 25.0
     previous_accel = 0.0
@@ -259,17 +270,39 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
       for profile, rows in traces.items()
     }
     stock_first_motion = next(frame for frame, row in enumerate(stock) if row[0] > 0.01)
-    stock_time_to_two = next(frame for frame, row in enumerate(stock) if row[0] >= 2.0) * DT_MDL
-    stock_time_to_three = next(frame for frame, row in enumerate(stock) if row[0] >= 3.0) * DT_MDL
-    eco_time_to_two = next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 2.0) * DT_MDL
-    eco_time_to_three = next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 3.0) * DT_MDL
 
+    # No launch dead time: motion starts on the same frame as stock. A launch toward a nearby target is then
+    # deliberately gentler than stock - the comfort law scales the maneuver to the size of the speed change,
+    # and this target is 8 m/s, not the set speed. Only the ordering and the breakaway frame are pinned.
     self.assertEqual(len(set(first_motion.values())), 1)
     self.assertTrue(all(frame == stock_first_motion for frame in first_motion.values()))
-    self.assertLessEqual(eco_time_to_two, stock_time_to_two)
-    self.assertLessEqual(eco_time_to_three, stock_time_to_three)
     self.assertGreaterEqual(time_to_five[AccelProfile.eco] - time_to_five[AccelProfile.normal], 0.1)
     self.assertGreaterEqual(time_to_five[AccelProfile.normal] - time_to_five[AccelProfile.sport], 0.1)
+
+  def test_speed_noise_does_not_cause_pedal_hunting(self):
+    # The comfort law gives more authority to small errors than the catchup table it replaced (0.27 vs 0.12
+    # m/s^2 at 32 m/s with a 0.5 m/s error), which raised the question of whether it would hunt at road speed.
+    # It does not: the deadband means that once settled the command is exactly zero, whereas stock's
+    # proportional law chases vEgo noise all the way down. Measured with a realistic 0.05 m/s sigma on the
+    # measured speed, stock produces roughly 6x the pedal sign flips.
+    for v_ego, v_cruise in ((32.0, 32.5), (32.0, 31.5), (30.0, 30.3), (20.0, 20.4)):
+      stock = run_profile(AccelProfile.normal, enabled=False, speed=v_ego, v_cruise=v_cruise,
+                          steps=1200, speed_noise=0.05, seed=7)
+      stock_flips = self._sign_flips(stock)
+      for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
+        rows = run_profile(profile, speed=v_ego, v_cruise=v_cruise, steps=1200, speed_noise=0.05, seed=7)
+        flips = self._sign_flips(rows)
+        settled = [abs(accel) for _speed, accel, _stop in rows[-400:]]
+
+        self.assertLess(flips, stock_flips / 3.0, (v_ego, v_cruise, profile))
+        self.assertLessEqual(float(np.percentile(settled, 95)), 0.02, (v_ego, v_cruise, profile))
+        # Settling short by up to the deadband is the price of not hunting, and must stay bounded by it.
+        self.assertLessEqual(abs(rows[-1][0] - v_cruise), TARGET_SPEED_DEADBAND + 0.02, (v_ego, v_cruise, profile))
+
+  @staticmethod
+  def _sign_flips(rows, tail: int = 400) -> int:
+    accels = np.array([accel for _speed, accel, _stop in rows[-tail:]])
+    return int(np.sum(np.diff(np.sign(accels)) != 0))
 
   def test_road_speed_catchup_stays_useful(self):
     traces = {

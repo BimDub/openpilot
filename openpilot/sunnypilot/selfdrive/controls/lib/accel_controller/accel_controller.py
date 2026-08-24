@@ -15,20 +15,30 @@ from openpilot.sunnypilot import get_sanitize_int_param
 AccelProfile = custom.LongitudinalPlanSP.AccelController.Profile
 
 MAX_ACCEL_BREAKPOINTS = [0., 3., 5., 10., 20., 25., 40.]
+# Road-speed values are held to a fraction of stock (A_CRUISE_MAX_VALS interpolates to 0.80 at 25 m/s and
+# 0.60 at 40 m/s): eco ~65-70%, normal ~85%. Below that a profile cannot hold speed on grade - 1% of grade
+# costs 0.098 m/s^2 of gravity - and merges and passes stop working. eco never exceeds stock anywhere.
 MAX_ACCEL_PROFILES = {
-  AccelProfile.eco:    [1.80, 1.60, 1.25, 0.88, 0.70, 0.35, 0.20],
-  AccelProfile.normal: [1.90, 1.80, 1.45, 0.99, 0.85, 0.48, 0.30],
-  AccelProfile.sport:  [2.00, 2.00, 1.90, 1.35, 1.10, 0.68, 0.45],
+  AccelProfile.eco:    [1.60, 1.48, 1.22, 0.86, 0.66, 0.52, 0.40],
+  AccelProfile.normal: [1.90, 1.70, 1.42, 0.99, 0.80, 0.66, 0.52],
+  AccelProfile.sport:  [2.00, 2.00, 1.86, 1.30, 1.02, 0.86, 0.72],
 }
-MIN_ACCEL_BREAKPOINTS = [5., 40.]
-MIN_ACCEL_VALUES = [-0.45, -0.80]
-TARGET_SPEED_DEADBAND = 0.2  # m/s
-TARGET_SPEED_APPROACH_WINDOW = 2.0  # m/s
-TARGET_SPEED_APPROACH_GAIN = 0.5
-TARGET_SPEED_APPROACH_MIN_SPEED = 3.0  # m/s
-TARGET_SPEED_APPROACH_FULL_SPEED = 5.0  # m/s
-CATCHUP_ERROR_BREAKPOINTS = [TARGET_SPEED_DEADBAND, 0.5, 1.0, 2.0, 3.0, 4.0]
-CATCHUP_ACCEL_SCALE = [0.0, 0.3, 0.5, 0.7, 0.85, 1.0]
+# Comfort budget for a speed change. sqrt(J * dv) is the peak acceleration of a constant-jerk maneuver that
+# changes speed by dv, and closing the error with that law releases at a constant J / 2 - so the jerk you
+# actually feel is HALF of J, not J. Deceleration converges on stock's A_CRUISE_MIN once
+# |dv| > A_CRUISE_MIN**2 / J + TARGET_SPEED_DEADBAND: eco 9.8 m/s (22 mph), normal 6.0 (13), sport 4.0 (9).
+# Beyond that every profile uses stock authority. This is the only knob that separates the profiles for
+# small and medium speed changes, and the only one that makes them differ on the brake side at all.
+COMFORT_JERK = {
+  AccelProfile.eco:    0.15,
+  AccelProfile.normal: 0.25,
+  AccelProfile.sport:  0.38,
+}
+TARGET_SPEED_DEADBAND = 0.2  # m/s, errors below this are not worth a pedal input
+# Authority needed to actually break away from a stop. Without this, sqrt(J * dv) toward a small target
+# (creeping in traffic) commands less than the powertrain's breakaway acceleration and the car never moves.
+LAUNCH_FLOOR_BREAKPOINTS = [1.0, 3.0]  # m/s
+LAUNCH_FLOOR_VALUES = [1.2, 0.0]  # m/s^2
 
 
 class AccelController:
@@ -51,46 +61,46 @@ class AccelController:
   def is_enabled(self) -> bool:
     return self._enabled
 
-  def get_max_accel(self, v_ego: float, v_target: float | None = None) -> float:
+  def get_max_accel(self, v_ego: float) -> float:
+    """Speed-scheduled acceleration authority: the hardest this profile will ever pull at this speed."""
+    return float(np.interp(max(0.0, v_ego), MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES[self._profile]))
+
+  def get_comfort_accel(self, v_ego: float, v_target: float) -> float:
+    """Acceleration that closes v_target - v_ego over a human-length maneuver.
+
+    Deliberately unbounded below: stock's own clip to A_CRUISE_MIN is what guarantees a large speed drop is
+    never braked more gently than stock, so adding a decel cap here would only ever brake less than stock.
+    """
     v_ego = max(0.0, v_ego)
-    max_accel = float(np.interp(v_ego, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES[self._profile]))
-    if v_target is None or not np.isfinite(v_target) or v_ego <= TARGET_SPEED_APPROACH_MIN_SPEED or v_target <= v_ego:
-      return max_accel
-
     speed_error = v_target - v_ego
-    speed_blend = float(np.interp(v_ego, [TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_FULL_SPEED], [0.0, 1.0]))
-    catchup_scale = float(np.interp(speed_error, CATCHUP_ERROR_BREAKPOINTS, CATCHUP_ACCEL_SCALE))
-    raw_accel = min(speed_error, max_accel)
-    catchup_accel = min(speed_error, max_accel * catchup_scale)
-    return float(raw_accel + speed_blend * (catchup_accel - raw_accel))
+    error = max(0.0, abs(speed_error) - TARGET_SPEED_DEADBAND)
+    if not error > 0.0:  # also short-circuits a non-finite target
+      return 0.0
 
-  def get_min_accel(self, v_ego: float) -> float:
-    return float(np.interp(max(0.0, v_ego), MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES))
+    # The linear term keeps the slope finite at the deadband edge, where sqrt() is vertical: without it a
+    # 0.201 m/s error asks for 0.019 m/s^2 and a 0.21 m/s error asks for 0.06, a wall right where the loop
+    # sits when settled. It binds below error == COMFORT_JERK and the sqrt binds above it.
+    accel = min(error, float(np.sqrt(COMFORT_JERK[self._profile] * error)))
+    if speed_error < 0.0:
+      return -accel
 
-  def get_cruise_target(self, v_ego: float, v_target: float, comfort_decel: bool = False) -> float:
+    launch = float(np.interp(v_ego, LAUNCH_FLOOR_BREAKPOINTS, LAUNCH_FLOOR_VALUES))
+    return min(max(accel, launch), error, self.get_max_accel(v_ego))
+
+  def get_cruise_target(self, v_ego: float, v_target: float) -> float:
+    """Virtual set speed whose stock 1 s proportional response equals the comfort acceleration.
+
+    v_target <= 0 is how force_decel reaches this hook (the stock planner zeroes v_cruise), so it must pass
+    through untouched.
+    """
     if not np.isfinite(v_target) or v_target <= 0.0:
       return v_target
 
-    speed_error = v_target - v_ego
-    if speed_error >= 0.0:
-      return v_target
-
-    adjusted_error = speed_error
-    if v_ego > TARGET_SPEED_APPROACH_MIN_SPEED:
-      speed_blend = float(np.interp(v_ego, [TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_FULL_SPEED], [0.0, 1.0]))
-      target_blend = float(np.interp(abs(speed_error), [TARGET_SPEED_DEADBAND, TARGET_SPEED_APPROACH_WINDOW], [1.0, 0.0]))
-      deadband = TARGET_SPEED_DEADBAND * speed_blend * target_blend
-      adjusted_error = np.sign(speed_error) * max(0.0, abs(speed_error) - deadband)
-      gain = 1.0 - (1.0 - TARGET_SPEED_APPROACH_GAIN) * speed_blend * target_blend
-      adjusted_error *= gain
-
-    if comfort_decel:
-      adjusted_error = max(adjusted_error, self.get_min_accel(v_ego))
-    return float(v_ego + adjusted_error)
+    return float(v_ego + self.get_comfort_accel(v_ego, v_target))
 
   def get_lead_departure_accel(self, v_ego: float, v_lead: float, a_lead: float, mpc_accel: float) -> float:
     values = (v_ego, v_lead, a_lead, mpc_accel)
     if not self._enabled or not all(np.isfinite(value) for value in values) or a_lead < 0.0 or mpc_accel < 0.0 or v_lead <= v_ego:
       return mpc_accel
 
-    return max(mpc_accel, min(v_lead - v_ego, self.get_max_accel(v_ego, v_lead)))
+    return max(mpc_accel, self.get_comfort_accel(v_ego, v_lead))
