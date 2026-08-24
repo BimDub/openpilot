@@ -12,12 +12,12 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.controls.lib.longitudinal_planner import (
-  A_CRUISE_MAX_BP, A_CRUISE_MIN, J_CRUISE_VALS, get_cruise_accel, get_max_accel,
+  A_CRUISE_MAX_BP, A_CRUISE_MIN, J_CRUISE_VALS, get_cruise_accel,
 )
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_controller.accel_controller import (
   AccelController, AccelProfile, CATCHUP_ACCEL_SCALE, CATCHUP_ERROR_BREAKPOINTS, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES,
-  TARGET_SPEED_APPROACH_FULL_SPEED, TARGET_SPEED_APPROACH_GAIN, TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_WINDOW,
-  TARGET_SPEED_DEADBAND,
+  MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES, TARGET_SPEED_APPROACH_FULL_SPEED, TARGET_SPEED_APPROACH_GAIN,
+  TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_WINDOW, TARGET_SPEED_DEADBAND,
 )
 
 
@@ -58,16 +58,15 @@ class TestAccelController(OpenpilotTestCase):
       for speed in np.linspace(0.0, 55.0, 551):
         assert controller.get_max_accel(speed) <= ACCEL_MAX
 
-  def test_normal_matches_stock_and_profiles_bracket_it(self):
-    controllers = {
-      profile: self.set_profile(profile)
-      for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)
-    }
-    for speed in np.linspace(0.0, 40.0, 401):
-      stock = get_max_accel(speed)
-      assert controllers[AccelProfile.eco].get_max_accel(speed) <= stock + 1e-12
-      assert np.isclose(controllers[AccelProfile.normal].get_max_accel(speed), stock)
-      assert controllers[AccelProfile.sport].get_max_accel(speed) >= stock - 1e-12
+  def test_min_accel_bpv_is_profile_independent_and_within_stock_cruise_floor(self):
+    controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
+    for speed, expected in zip(MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES, strict=True):
+      assert all(controller.get_min_accel(speed) == expected for controller in controllers)
+
+    values = np.asarray([controllers[0].get_min_accel(speed) for speed in np.linspace(0.0, 55.0, 551)])
+    assert np.all(values >= A_CRUISE_MIN)
+    assert np.all(values < 0.0)
+    assert np.all(np.diff(values) <= 1e-12)
 
   def test_profiles_have_material_separation(self):
     controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
@@ -78,10 +77,13 @@ class TestAccelController(OpenpilotTestCase):
     for speed in MAX_ACCEL_BREAKPOINTS[1:-1]:
       assert controllers[2].get_max_accel(speed) - controllers[0].get_max_accel(speed) >= 0.3 - 1e-12
 
-  def test_eco_keeps_useful_road_speed_acceleration(self):
-    controller = self.set_profile(AccelProfile.eco)
-    for speed in np.linspace(8.0, 40.0, 321):
-      assert controller.get_max_accel(speed) >= 0.8 * get_max_accel(speed) - 1e-12
+  def test_profiles_taper_to_gentle_highway_acceleration(self):
+    controllers = [self.set_profile(profile) for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)]
+    for speed in np.linspace(25.0, 40.0, 151):
+      eco, normal, sport = (controller.get_max_accel(speed) for controller in controllers)
+      assert eco <= 0.35
+      assert normal <= 0.48
+      assert sport <= 0.68
 
   def test_comfort_profile_caps_taper_after_launch(self):
     for profile in (AccelProfile.eco, AccelProfile.normal):
@@ -115,6 +117,12 @@ class TestAccelController(OpenpilotTestCase):
       assert above >= below
       assert above - below < 1e-4
 
+  def test_nonfinite_target_uses_profile_cap(self):
+    controller = self.set_profile(AccelProfile.normal)
+    base_limit = controller.get_max_accel(20.0)
+    for target in (float("nan"), float("inf"), -float("inf")):
+      assert controller.get_max_accel(20.0, target) == base_limit
+
   def test_cruise_decel_settling_is_continuous(self):
     controller = self.set_profile(AccelProfile.normal)
     v_ego = 20.0
@@ -133,6 +141,24 @@ class TestAccelController(OpenpilotTestCase):
     assert np.all(np.isfinite(shaped_errors))
     assert np.all(np.diff(shaped_errors) >= 0.0)
     assert np.all(np.abs(shaped_errors) <= np.abs(errors) + 1e-12)
+
+  def test_comfort_decel_caps_only_negative_positive_speed_targets(self):
+    controller = self.set_profile(AccelProfile.normal)
+    v_ego = 20.0
+    min_accel = controller.get_min_accel(v_ego)
+
+    assert controller.get_cruise_target(v_ego, 15.0) == 15.0
+    assert np.isclose(controller.get_cruise_target(v_ego, 15.0, comfort_decel=True), v_ego + min_accel)
+    assert controller.get_cruise_target(v_ego, 25.0, comfort_decel=True) == 25.0
+    assert controller.get_cruise_target(v_ego, 0.0, comfort_decel=True) == 0.0
+    assert np.isnan(controller.get_cruise_target(v_ego, float("nan"), comfort_decel=True))
+    assert controller.get_cruise_target(v_ego, float("inf"), comfort_decel=True) == float("inf")
+
+    errors = np.linspace(-5.0, -1e-4, 501)
+    shaped = np.asarray([controller.get_cruise_target(v_ego, v_ego + error, comfort_decel=True) - v_ego for error in errors])
+    assert np.all(np.isfinite(shaped))
+    assert np.all(shaped >= min_accel - 1e-12)
+    assert np.all(np.diff(shaped) >= -1e-12)
 
   def test_lead_departure_accel_is_bounded_by_lead_speed_and_profile(self):
     controller = self.set_profile(AccelProfile.eco)
@@ -199,7 +225,8 @@ class TestAccelController(OpenpilotTestCase):
     self.params.put("AccelPersonality", AccelProfile.sport, block=True)
     controller.frame = int(1.0 / DT_MDL) - 1
     controller.update()
-    assert controller.get_max_accel(10.0) == MAX_ACCEL_PROFILES[AccelProfile.sport][1]
+    index = MAX_ACCEL_BREAKPOINTS.index(10.0)
+    assert controller.get_max_accel(10.0) == MAX_ACCEL_PROFILES[AccelProfile.sport][index]
 
   def test_params_refresh_once_per_second(self):
     controller = self.set_profile(AccelProfile.normal)
@@ -311,7 +338,48 @@ class TestPlannerIntegration(OpenpilotTestCase):
 
     planner.source = LongitudinalPlanSource.sccVision
     assert planner.get_cruise_target_override(20.0, 20.5, e2e=True) == 20.5
-    assert planner.get_max_accel_override(20.0, 20.5, e2e=True) == planner.accel_controller.get_max_accel(20.0)
+    assert np.isclose(planner.get_max_accel_override(20.0, 20.5, e2e=True), expected_limit)
+
+  def test_comfort_decel_is_ordinary_cruise_only(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanSource
+
+    self.params.put_bool("AccelPersonalityEnabled", True, block=True)
+    planner = _bare_planner()
+    speed = 20.0
+    target = 15.0
+    expected = planner.accel_controller.get_cruise_target(speed, target, comfort_decel=True)
+
+    for allow_throttle in (False, True):
+      planner.allow_throttle = allow_throttle
+      planner.accel_controller_active = False
+      assert planner.get_cruise_target_override(speed, target, e2e=False) == expected
+      assert planner.accel_controller_active
+
+    planner.accel_controller_active = False
+    assert planner.get_cruise_target_override(speed, target, e2e=True) == target
+    assert not planner.accel_controller_active
+
+    for source in (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap, LongitudinalPlanSource.speedLimitAssist):
+      planner.source = source
+      assert planner.get_cruise_target_override(speed, target, e2e=False) == target
+
+    planner.source = LongitudinalPlanSource.cruise
+    assert planner.get_cruise_target_override(speed, 0.0, e2e=False) == 0.0
+
+  def test_selected_sunnypilot_target_uses_catchup_taper(self):
+    from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanSource
+
+    self.params.put_bool("AccelPersonalityEnabled", True, block=True)
+    planner = _bare_planner()
+    speed = 32.0
+    target = speed + 1.4
+    base_limit = planner.accel_controller.get_max_accel(speed)
+    tapered_limit = planner.accel_controller.get_max_accel(speed, target)
+
+    assert tapered_limit < base_limit
+    for source in (LongitudinalPlanSource.sccVision, LongitudinalPlanSource.sccMap, LongitudinalPlanSource.speedLimitAssist):
+      planner.source = source
+      assert np.isclose(planner.get_max_accel_override(speed, target, e2e=False), tapered_limit)
 
 
 def _fake_cp():

@@ -154,9 +154,17 @@ class DynamicExperimentalController:
     future = min(probs[1].prob, probs[2].prob) if len(probs) >= 3 else 1.0
     return bool(lead_now and future > LEAD_FUTURE_PROB_VANISH)
 
-  def _update_lead_veto(self, raw_veto: bool) -> bool:
-    self._lead_veto_frames = min(self._lead_veto_frames + 1, LEAD_VETO_CONFIRM_FRAMES) if raw_veto else 0
-    return self._lead_veto_frames >= LEAD_VETO_CONFIRM_FRAMES
+  def _update_lead_veto(self, raw_veto: bool, lead_present: bool, urgent_override: bool) -> bool:
+    if raw_veto:
+      self._lead_veto_frames = min(self._lead_veto_frames + 1, LEAD_VETO_CONFIRM_FRAMES)
+      return self.lead_veto or self._lead_veto_frames >= LEAD_VETO_CONFIRM_FRAMES
+
+    if not lead_present or urgent_override or not self.lead_veto:
+      self._lead_veto_frames = 0
+      return False
+
+    self._lead_veto_frames = max(self._lead_veto_frames - 1, 0)
+    return self._lead_veto_frames > 0
 
   def update(self, sm: messaging.SubMaster) -> None:
     self._read_params()
@@ -166,18 +174,22 @@ class DynamicExperimentalController:
     radar_state = sm['radarState']
 
     is_creeping = self._update_creeping(car_state.vEgo)
-    self.lead_veto = self._update_lead_veto(self._lead_veto(radar_state, md))
-
+    lead_present = radar_state.leadOne.present or radar_state.leadTwo.present
     self.signals = DecSignals(
       decel_intent=self._decel_intent(md),
       curve_detected=self._curve_detected(md),
       model_trust=self._model_trust(md),
-      creeping=is_creeping,
+      creeping=is_creeping and not lead_present,
     )
     self.want_blended = should_blend(self.signals)
 
     crash_override = self._mpc.crash_cnt >= 1
     hard_brake_override = bool(md.meta.hardBrakePredicted)
+    strong_stop = self.signals.model_trust >= MODEL_TRUST_MIN and self.signals.decel_intent >= DECEL_INTENT_CURVE_OVERRIDE
+    raw_lead_veto = self._lead_veto(radar_state, md)
+    urgent_release = (crash_override or hard_brake_override or strong_stop) and not raw_lead_veto
+    self.lead_veto = self._update_lead_veto(raw_lead_veto, lead_present, urgent_release)
+
     override = (crash_override or hard_brake_override) and not self.lead_veto
 
     if self._enabled:

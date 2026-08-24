@@ -230,6 +230,109 @@ class TestDynamicExperimentalController(OpenpilotTestCase):
     assert controller.mode() == "acc"
     assert controller.lead_veto
 
+  def test_lead_prevents_creep_only_blending_when_model_probability_drops(self):
+    controller = make_controller()
+    confirmed_sm = make_sm(v_ego=1.0, velocity=flat_velocity(1.0), lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES):
+      controller.update(confirmed_sm)
+    assert controller.lead_veto
+
+    low_probability_sm = make_sm(v_ego=1.0, velocity=flat_velocity(1.0), lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(low_probability_sm)
+      assert controller.lead_veto
+      assert controller.mode() == "acc"
+
+    for _ in range(20):
+      controller.update(low_probability_sm)
+      assert not controller.lead_veto
+      assert not controller.signals.creeping
+      assert controller.mode() == "acc"
+
+    no_lead_sm = make_sm(v_ego=1.0, velocity=flat_velocity(1.0), lead_present=False, lead_probs=[1.0, 0.1, 0.1])
+    for _ in range(ENTER_FRAMES):
+      controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+
+  def test_confirmed_lead_veto_ignores_short_future_probability_dropout(self):
+    controller = make_controller()
+    confirmed_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -1.0),
+                           lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES):
+      controller.update(confirmed_sm)
+    assert controller.lead_veto
+
+    dropout_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -1.0),
+                         lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(dropout_sm)
+      assert controller.lead_veto
+      assert controller.mode() == "acc"
+
+    controller.update(confirmed_sm)
+    assert controller.lead_veto
+    assert controller.mode() == "acc"
+
+  def test_urgent_override_bypasses_confirmed_veto_release(self):
+    controller = make_controller()
+    confirmed_sm = make_sm(v_ego=20.0, velocity=flat_velocity(20.0),
+                           lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES):
+      controller.update(confirmed_sm)
+    assert controller.lead_veto
+
+    hard_brake_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0), hard_brake=True,
+                            lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    controller.update(hard_brake_sm)
+    assert not controller.lead_veto
+    assert controller.mode() == "blended"
+
+  def test_trusted_strong_stop_bypasses_confirmed_veto_release(self):
+    controller = make_controller()
+    confirmed_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                           lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES):
+      controller.update(confirmed_sm)
+    assert controller.lead_veto
+    assert controller.mode() == "acc"
+
+    departing_lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                                lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    controller.update(departing_lead_sm)
+    assert not controller.lead_veto
+    assert controller.mode() == "blended"
+
+  def test_degraded_strong_stop_does_not_bypass_confirmed_veto_release(self):
+    controller = make_controller()
+    confirmed_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                           lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES):
+      controller.update(confirmed_sm)
+    assert controller.lead_veto
+
+    degraded_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0), lead_present=True,
+                          lead_probs=[1.0, 0.1, 0.1], frame_drop_perc=60.0)
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(degraded_sm)
+      assert controller.lead_veto
+      assert controller.mode() == "acc"
+
+  def test_model_slowdown_still_blends_while_creeping_with_a_lead(self):
+    controller = make_controller()
+    sm = make_sm(v_ego=1.0, velocity=decel_velocity(1.0, -1.0), lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    for _ in range(ENTER_FRAMES):
+      controller.update(sm)
+    assert not controller.lead_veto
+    assert controller.mode() == "blended"
+
+  def test_hard_brake_still_blends_while_creeping_with_a_lead(self):
+    controller = make_controller()
+    sm = make_sm(v_ego=1.0, velocity=flat_velocity(1.0), hard_brake=True,
+                 lead_present=True, lead_probs=[1.0, 0.1, 0.1])
+    controller.update(sm)
+    assert not controller.lead_veto
+    assert controller.mode() == "blended"
+
   def test_creep_hysteresis_band_without_lead(self):
     controller = make_controller()
     controller.update(make_sm(v_ego=1.5, velocity=flat_velocity(1.5)))

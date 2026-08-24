@@ -14,12 +14,14 @@ from openpilot.sunnypilot import get_sanitize_int_param
 
 AccelProfile = custom.LongitudinalPlanSP.AccelController.Profile
 
-MAX_ACCEL_BREAKPOINTS = [0., 10., 25., 40.]
+MAX_ACCEL_BREAKPOINTS = [0., 3., 5., 10., 20., 25., 40.]
 MAX_ACCEL_PROFILES = {
-  AccelProfile.eco:    [1.40, 1.05, 0.68, 0.50],
-  AccelProfile.normal: [1.60, 1.20, 0.80, 0.60],
-  AccelProfile.sport:  [2.00, 1.60, 1.20, 0.85],
+  AccelProfile.eco:    [1.80, 1.60, 1.25, 0.88, 0.70, 0.35, 0.20],
+  AccelProfile.normal: [1.90, 1.80, 1.45, 0.99, 0.85, 0.48, 0.30],
+  AccelProfile.sport:  [2.00, 2.00, 1.90, 1.35, 1.10, 0.68, 0.45],
 }
+MIN_ACCEL_BREAKPOINTS = [5., 40.]
+MIN_ACCEL_VALUES = [-0.45, -0.80]
 TARGET_SPEED_DEADBAND = 0.2  # m/s
 TARGET_SPEED_APPROACH_WINDOW = 2.0  # m/s
 TARGET_SPEED_APPROACH_GAIN = 0.5
@@ -52,7 +54,7 @@ class AccelController:
   def get_max_accel(self, v_ego: float, v_target: float | None = None) -> float:
     v_ego = max(0.0, v_ego)
     max_accel = float(np.interp(v_ego, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES[self._profile]))
-    if v_target is None or v_ego <= TARGET_SPEED_APPROACH_MIN_SPEED or v_target <= v_ego:
+    if v_target is None or not np.isfinite(v_target) or v_ego <= TARGET_SPEED_APPROACH_MIN_SPEED or v_target <= v_ego:
       return max_accel
 
     speed_error = v_target - v_ego
@@ -62,20 +64,29 @@ class AccelController:
     catchup_accel = min(speed_error, max_accel * catchup_scale)
     return float(raw_accel + speed_blend * (catchup_accel - raw_accel))
 
-  def get_cruise_target(self, v_ego: float, v_target: float) -> float:
-    if v_ego <= TARGET_SPEED_APPROACH_MIN_SPEED:
+  def get_min_accel(self, v_ego: float) -> float:
+    return float(np.interp(max(0.0, v_ego), MIN_ACCEL_BREAKPOINTS, MIN_ACCEL_VALUES))
+
+  def get_cruise_target(self, v_ego: float, v_target: float, comfort_decel: bool = False) -> float:
+    if not np.isfinite(v_target) or v_target <= 0.0:
       return v_target
 
     speed_error = v_target - v_ego
     if speed_error >= 0.0:
       return v_target
 
-    speed_blend = float(np.interp(v_ego, [TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_FULL_SPEED], [0.0, 1.0]))
-    target_blend = float(np.interp(abs(speed_error), [TARGET_SPEED_DEADBAND, TARGET_SPEED_APPROACH_WINDOW], [1.0, 0.0]))
-    deadband = TARGET_SPEED_DEADBAND * speed_blend * target_blend
-    adjusted_error = np.sign(speed_error) * max(0.0, abs(speed_error) - deadband)
-    gain = 1.0 - (1.0 - TARGET_SPEED_APPROACH_GAIN) * speed_blend * target_blend
-    return float(v_ego + gain * adjusted_error)
+    adjusted_error = speed_error
+    if v_ego > TARGET_SPEED_APPROACH_MIN_SPEED:
+      speed_blend = float(np.interp(v_ego, [TARGET_SPEED_APPROACH_MIN_SPEED, TARGET_SPEED_APPROACH_FULL_SPEED], [0.0, 1.0]))
+      target_blend = float(np.interp(abs(speed_error), [TARGET_SPEED_DEADBAND, TARGET_SPEED_APPROACH_WINDOW], [1.0, 0.0]))
+      deadband = TARGET_SPEED_DEADBAND * speed_blend * target_blend
+      adjusted_error = np.sign(speed_error) * max(0.0, abs(speed_error) - deadband)
+      gain = 1.0 - (1.0 - TARGET_SPEED_APPROACH_GAIN) * speed_blend * target_blend
+      adjusted_error *= gain
+
+    if comfort_decel:
+      adjusted_error = max(adjusted_error, self.get_min_accel(v_ego))
+    return float(v_ego + adjusted_error)
 
   def get_lead_departure_accel(self, v_ego: float, v_lead: float, a_lead: float, mpc_accel: float) -> float:
     values = (v_ego, v_lead, a_lead, mpc_accel)

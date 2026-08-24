@@ -50,7 +50,8 @@ def run_profile(profile: int, *, enabled: bool = True, speed: float = 0.0, v_cru
   for frame in range(steps):
     target_speed = v_cruise if v_cruise_fn is None else v_cruise_fn(frame)
     use_profile = controller.is_enabled()
-    cruise_target = controller.get_cruise_target(speed, target_speed) if use_profile else target_speed
+    comfort_decel = not e2e and 0.0 < target_speed < speed
+    cruise_target = controller.get_cruise_target(speed, target_speed, comfort_decel=comfort_decel) if use_profile else target_speed
     max_accel_override = controller.get_max_accel(speed, target_speed) if use_profile else None
     accel = get_cruise_accel(e2e, cruise_target, speed, accel, 0.0, CarParams(), DT_MDL, 2.0, True, max_accel_override)
     speed = max(0.0, speed + accel * DT_MDL)
@@ -86,7 +87,7 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
     self.assertEqual(len(set(first_motion.values())), 1)
     self.assertTrue(all(trace[0, 2] > 0.0 and trace[1, 3] > 0.0 for trace in traces.values()))
     self.assertLess(time_to_20[AccelProfile.eco], 8.0)
-    self.assertLess(time_to_50[AccelProfile.eco], 24.0)
+    self.assertLess(time_to_50[AccelProfile.eco], 27.0)
     self.assertGreaterEqual(time_to_20[AccelProfile.eco] - time_to_20[AccelProfile.normal], 0.5)
     self.assertGreaterEqual(time_to_20[AccelProfile.normal] - time_to_20[AccelProfile.sport], 0.5)
     self.assertGreaterEqual(time_to_50[AccelProfile.eco] - time_to_50[AccelProfile.normal], 2.0)
@@ -199,16 +200,36 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
     for direction in ("accelerate", "decelerate"):
       self.assertLess(peak_corrections[True, direction], peak_corrections[False, direction])
 
-  def test_normal_matches_disabled_stock_path(self):
-    stock = run_profile(AccelProfile.normal, enabled=False, speed=4.0, steps=120)
+  def test_normal_launch_is_faster_than_eco(self):
+    eco = run_profile(AccelProfile.eco, speed=4.0, steps=120)
     normal = run_profile(AccelProfile.normal, speed=4.0, steps=120)
-    self.assertEqual(normal, stock)
+    self.assertGreater(normal[-1][0], eco[-1][0])
 
   def test_profiles_do_not_change_far_braking(self):
     for e2e in (False, True):
       stock = run_profile(AccelProfile.normal, enabled=False, speed=20.0, v_cruise=0.0, e2e=e2e, steps=100)
       for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport):
         self.assertEqual(run_profile(profile, speed=20.0, v_cruise=0.0, e2e=e2e, steps=100), stock)
+
+  def test_comfort_cruise_decel_is_gentle_smooth_and_profile_independent(self):
+    stock = run_profile(AccelProfile.normal, enabled=False, speed=25.0, v_cruise=20.0, steps=220)
+    traces = {
+      profile: run_profile(profile, speed=25.0, v_cruise=20.0, steps=220)
+      for profile in (AccelProfile.eco, AccelProfile.normal, AccelProfile.sport)
+    }
+
+    self.assertEqual(traces[AccelProfile.eco], traces[AccelProfile.normal])
+    self.assertEqual(traces[AccelProfile.normal], traces[AccelProfile.sport])
+    self.assertGreater(min(row[1] for row in traces[AccelProfile.normal]), min(row[1] for row in stock))
+
+    previous_speed = 25.0
+    previous_accel = 0.0
+    for speed, accel, _should_stop in traces[AccelProfile.normal]:
+      jerk_step = float(np.interp(previous_speed, A_CRUISE_MAX_BP, J_CRUISE_VALS)) * DT_MDL
+      self.assertLessEqual(abs(accel - previous_accel), jerk_step + 1e-12)
+      self.assertLessEqual(accel, 1e-12)
+      previous_speed = speed
+      previous_accel = accel
 
   def test_blended_launch_respects_profiles(self):
     traces = {
@@ -240,13 +261,15 @@ class TestAccelControllerClosedLoop(OpenpilotTestCase):
     stock_first_motion = next(frame for frame, row in enumerate(stock) if row[0] > 0.01)
     stock_time_to_two = next(frame for frame, row in enumerate(stock) if row[0] >= 2.0) * DT_MDL
     stock_time_to_three = next(frame for frame, row in enumerate(stock) if row[0] >= 3.0) * DT_MDL
+    eco_time_to_two = next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 2.0) * DT_MDL
+    eco_time_to_three = next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 3.0) * DT_MDL
 
     self.assertEqual(len(set(first_motion.values())), 1)
     self.assertTrue(all(frame == stock_first_motion for frame in first_motion.values()))
-    self.assertLess(stock_time_to_two, next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 2.0) * DT_MDL)
-    self.assertLess(stock_time_to_three, next(frame for frame, row in enumerate(traces[AccelProfile.eco]) if row[0] >= 3.0) * DT_MDL)
-    self.assertGreaterEqual(time_to_five[AccelProfile.eco] - time_to_five[AccelProfile.normal], 0.3)
-    self.assertGreaterEqual(time_to_five[AccelProfile.normal] - time_to_five[AccelProfile.sport], 0.3)
+    self.assertLessEqual(eco_time_to_two, stock_time_to_two)
+    self.assertLessEqual(eco_time_to_three, stock_time_to_three)
+    self.assertGreaterEqual(time_to_five[AccelProfile.eco] - time_to_five[AccelProfile.normal], 0.1)
+    self.assertGreaterEqual(time_to_five[AccelProfile.normal] - time_to_five[AccelProfile.sport], 0.1)
 
   def test_road_speed_catchup_stays_useful(self):
     traces = {

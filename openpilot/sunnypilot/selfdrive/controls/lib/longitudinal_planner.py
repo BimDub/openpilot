@@ -56,13 +56,19 @@ class LongitudinalPlannerSP:
     self.accel_controller_active = bool(self.accel_controller.is_enabled() and (e2e or self.allow_throttle))
     if not self.accel_controller_active:
       return None
-    target = v_target if self.source == LongitudinalPlanSource.cruise else None
-    return self.accel_controller.get_max_accel(v_ego, target)
+    return self.accel_controller.get_max_accel(v_ego, v_target)
 
   def get_cruise_target_override(self, v_ego: float, v_target: float, e2e: bool) -> float:
-    if not self.accel_controller.is_enabled() or self.source != LongitudinalPlanSource.cruise or not (e2e or self.allow_throttle):
+    if not self.accel_controller.is_enabled() or self.source != LongitudinalPlanSource.cruise:
       return v_target
-    return self.accel_controller.get_cruise_target(v_ego, v_target)
+
+    comfort_decel = not e2e and 0.0 < v_target < v_ego
+    if not comfort_decel and not (e2e or self.allow_throttle):
+      return v_target
+
+    target = self.accel_controller.get_cruise_target(v_ego, v_target, comfort_decel=comfort_decel)
+    self.accel_controller_active |= bool(math.isfinite(target) and target != v_target)
+    return target
 
   def update_allow_throttle(self, throttle_prob: float, low_speed_override: bool, threshold: float) -> bool:
     return self.throttle_intent_controller.update(throttle_prob, low_speed_override=low_speed_override, threshold=threshold)
