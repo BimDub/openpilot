@@ -30,6 +30,7 @@ DECEL_INTENT_CURVE_OVERRIDE = 0.9
 CURVE_Y_MAX = 5.0
 
 LEAD_FUTURE_PROB_VANISH = 0.35
+LEAD_VETO_CONFIRM_FRAMES = 4
 
 MODEL_DROP_TRUST_FULL = 5.0
 MODEL_DROP_TRUST_NONE = 30.0
@@ -101,6 +102,7 @@ class DynamicExperimentalController:
 
     self._hysteresis = ModeHysteresis()
     self._creeping = False
+    self._lead_veto_frames = 0
 
     self.signals = DecSignals()
     self.want_blended = False
@@ -152,6 +154,10 @@ class DynamicExperimentalController:
     future = min(probs[1].prob, probs[2].prob) if len(probs) >= 3 else 1.0
     return bool(lead_now and future > LEAD_FUTURE_PROB_VANISH)
 
+  def _update_lead_veto(self, raw_veto: bool) -> bool:
+    self._lead_veto_frames = min(self._lead_veto_frames + 1, LEAD_VETO_CONFIRM_FRAMES) if raw_veto else 0
+    return self._lead_veto_frames >= LEAD_VETO_CONFIRM_FRAMES
+
   def update(self, sm: messaging.SubMaster) -> None:
     self._read_params()
 
@@ -160,7 +166,7 @@ class DynamicExperimentalController:
     radar_state = sm['radarState']
 
     is_creeping = self._update_creeping(car_state.vEgo)
-    self.lead_veto = self._lead_veto(radar_state, md)
+    self.lead_veto = self._update_lead_veto(self._lead_veto(radar_state, md))
 
     self.signals = DecSignals(
       decel_intent=self._decel_intent(md),

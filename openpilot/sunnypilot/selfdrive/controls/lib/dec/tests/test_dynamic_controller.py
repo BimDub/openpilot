@@ -10,6 +10,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.dec.dec import (
   ModeHysteresis,
   should_blend,
   ENTER_FRAMES,
+  LEAD_VETO_CONFIRM_FRAMES,
   MIN_BLENDED_FRAMES,
 )
 
@@ -123,14 +124,75 @@ class TestDynamicExperimentalController(OpenpilotTestCase):
       controller.update(sm)
     assert controller.mode() == "blended"
 
-  def test_any_lead_forces_acc_even_with_strong_model_signal(self):
+  def test_persistent_lead_forces_acc_even_with_strong_model_signal(self):
     for lead_radar in (True, False):
       controller = make_controller()
       sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
                    lead_present=True, lead_radar=lead_radar, lead_probs=[1.0, 1.0, 1.0])
+      for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+        controller.update(sm)
+        assert not controller.lead_veto
       for _ in range(60):
         controller.update(sm)
+        assert controller.lead_veto
         assert controller.mode() == "acc"
+
+  def test_single_frame_lead_veto_pulse_does_not_leave_blended(self):
+    controller = make_controller()
+    no_lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0))
+    lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                      lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(ENTER_FRAMES):
+      controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+
+    controller.update(lead_sm)
+    assert controller.mode() == "blended"
+    assert not controller.lead_veto
+
+    controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+    assert not controller.lead_veto
+
+  def test_three_frame_lead_veto_pulse_does_not_leave_blended(self):
+    controller = make_controller()
+    no_lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0))
+    lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                      lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(ENTER_FRAMES):
+      controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(lead_sm)
+      assert controller.mode() == "blended"
+      assert not controller.lead_veto
+
+    controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+    assert not controller.lead_veto
+
+  def test_persistent_lead_veto_forces_acc_after_confirmation(self):
+    controller = make_controller()
+    no_lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0))
+    lead_sm = make_sm(v_ego=20.0, velocity=decel_velocity(20.0, -2.0),
+                      lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(ENTER_FRAMES):
+      controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(lead_sm)
+      assert controller.mode() == "blended"
+      assert not controller.lead_veto
+
+    controller.update(lead_sm)
+    assert controller.mode() == "acc"
+    assert controller.lead_veto
+
+    controller.update(no_lead_sm)
+    assert controller.mode() == "blended"
+    assert not controller.lead_veto
 
   def test_veto_releases_without_rebuild_lag(self):
     controller = make_controller()
@@ -204,12 +266,17 @@ class TestDynamicExperimentalController(OpenpilotTestCase):
     controller.update(sm)
     assert controller.mode() == "blended"
 
-  def test_hard_brake_override_inert_while_lead_present(self):
+  def test_confirmed_lead_veto_suppresses_hard_brake_override(self):
     controller = make_controller()
     sm = make_sm(v_ego=20.0, velocity=flat_velocity(20.0), hard_brake=True,
                  lead_present=True, lead_probs=[1.0, 1.0, 1.0])
+    for _ in range(LEAD_VETO_CONFIRM_FRAMES - 1):
+      controller.update(sm)
+      assert controller.mode() == "blended"
+      assert not controller.lead_veto
     controller.update(sm)
     assert controller.mode() == "acc"
+    assert controller.lead_veto
 
   def test_degraded_model_does_not_blend(self):
     controller = make_controller()

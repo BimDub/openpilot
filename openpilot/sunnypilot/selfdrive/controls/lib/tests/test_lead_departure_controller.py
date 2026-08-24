@@ -177,21 +177,36 @@ class TestLeadDepartureController(OpenpilotTestCase):
     assert not update(controller, sm, a_target=0.05, should_stop=True)
     assert controller.active
 
-  def test_active_release_latches_across_same_track_source_churn(self):
+  def test_active_release_latches_through_signal_and_source_churn(self):
     controller = LeadDepartureController(True)
     activate(controller)
-    sm = make_sm(lead_two=make_lead(d_rel=4.10), long_state=LongCtrlState.pid)
-    assert not update(controller, sm, source=MpcPlanSource.lead1)
-    assert controller.active
+    cases = (
+      (MpcPlanSource.lead0, make_sm(lead_one=make_lead(d_rel=4.10, v_lead=0.0), long_state=LongCtrlState.pid)),
+      (MpcPlanSource.lead1, make_sm(lead_two=make_lead(d_rel=4.12, v_rel=-0.2), long_state=LongCtrlState.pid)),
+      (MpcPlanSource.lead0, make_sm(lead_one=make_lead(d_rel=4.14, a_lead=-0.5), long_state=LongCtrlState.pid)),
+    )
+    for source, sm in cases:
+      assert not update(controller, sm, source=source)
+      assert controller.active
+
+  def test_inactive_release_requires_current_departure_signals(self):
+    cases = (
+      ('lead too slow', {'v_lead': LEAD_DEPARTURE_MIN_SPEED - 0.01}),
+      ('relative speed too low', {'v_rel': LEAD_DEPARTURE_MIN_SPEED - 0.01}),
+      ('lead braking', {'a_lead': -0.01}),
+    )
+    for name, lead_args in cases:
+      with self.subTest(name=name):
+        controller = LeadDepartureController(True)
+        for d_rel in (4.00, 4.02, 4.04):
+          assert update(controller, make_sm(lead_one=make_lead(d_rel=d_rel, **lead_args)))
+        assert not controller.active
 
   def test_active_release_cancels_on_invalid_state(self):
     cases = (
       ('lead lost', make_sm(lead_one=make_lead(present=False))),
       ('vision lead', make_sm(lead_one=make_lead(radar=False))),
       ('track changed', make_sm(lead_one=make_lead(track_id=9))),
-      ('lead too slow', make_sm(lead_one=make_lead(v_lead=LEAD_DEPARTURE_MIN_SPEED - 0.01))),
-      ('relative speed too low', make_sm(lead_one=make_lead(v_rel=LEAD_DEPARTURE_MIN_SPEED - 0.01))),
-      ('lead braking', make_sm(lead_one=make_lead(a_lead=-0.01))),
       ('gas', make_sm(gas=True)),
       ('brake', make_sm(brake=True)),
       ('override', make_sm(override=True)),

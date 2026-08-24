@@ -73,28 +73,34 @@ class LeadDepartureController:
       return should_stop
 
     lead = self._selected_lead(radar_state, source)
-    lead_valid = (
+    track_valid = (
       lead is not None
       and lead.present
       and lead.radar
       and lead.radarTrackId >= 0
       and all(math.isfinite(value) for value in (lead.dRel, lead.vLeadK, lead.vRel, lead.aLeadK))
       and lead.dRel > 0.0
-      and lead.vLeadK >= LEAD_DEPARTURE_MIN_SPEED
-      and lead.vRel >= LEAD_DEPARTURE_MIN_SPEED
-      and lead.aLeadK >= 0.0
-      and a_target >= 0.0
     )
-    if not lead_valid:
+    if not track_valid:
       self.reset()
       return should_stop
 
     track_id = int(lead.radarTrackId)
     if self._active:
-      if track_id != self._track_id:
+      if track_id != self._track_id or a_target < 0.0:
         self.reset()
         return should_stop
       return False
+
+    departure_cue = (
+      lead.vLeadK >= LEAD_DEPARTURE_MIN_SPEED
+      and lead.vRel >= LEAD_DEPARTURE_MIN_SPEED
+      and lead.aLeadK >= 0.0
+      and a_target >= 0.0
+    )
+    if not departure_cue:
+      self.reset()
+      return should_stop
 
     if not should_stop:
       self.reset()
